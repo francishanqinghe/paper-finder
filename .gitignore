@@ -1,0 +1,56 @@
+# Paper Finder runtime data
+/output/
+/tmp/
+
+# Python caches and test output
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Local Python environments
+.venv/
+venv/
+env/
+
+# JavaScript dependencies and caches
+node_modules/
+.npm/
+.yarn/
+.pnpm-store/
+
+# Build and packaging output
+/build/
+/dist/
+*.egg-info/
+
+# Credentials, browser sessions, and network captures
+.env
+.env.*
+!.env.example
+*.cookies
+*.cookiejar
+cookies.txt
+*.har
+*.headers
+.netrc
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Logs, editor files, and operating-system metadata
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~

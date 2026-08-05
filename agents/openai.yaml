@@ -1,0 +1,4 @@
+interface:
+  display_name: "Paper Finder"
+  short_description: "Retrieve verified sources by title or batch"
+  default_prompt: "Use $paper-finder to retrieve verified source files and URLs for these titles."
