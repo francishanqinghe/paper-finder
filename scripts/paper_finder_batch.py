@@ -9,9 +9,11 @@ import datetime as dt
 import hashlib
 import html
 from html.parser import HTMLParser
+import importlib.util
 import ipaddress
 import json
 import math
+import mmap
 import os
 import re
 import secrets
@@ -23,6 +25,7 @@ import sys
 import threading
 import time
 import unicodedata
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -34,7 +37,8 @@ except ImportError:  # pragma: no cover - unavailable on Windows
     resource = None  # type: ignore[assignment]
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+LEGACY_SCHEMA_VERSION = 1
 STATUSES = {
     "pending",
     "processing",
@@ -64,6 +68,14 @@ ARTIFACT_DISCOVERY_METHODS = {
     "collection_index",
     "user_supplied",
     "other",
+}
+DISCOVERY_METHODS_WITH_DISTINCT_DECLARING_URL = {
+    "registry_metadata",
+    "structured_data",
+    "embedded_document",
+    "download_link",
+    "repository_metadata",
+    "collection_index",
 }
 ROUTE_METRIC_PHASES = {"discovery", "retrieval", "verification"}
 PROVENANCE_SOURCE_ROLES = {
@@ -118,6 +130,7 @@ MAX_VERSIONS_PER_CANDIDATE = 200
 MAX_CANDIDATE_REVIEW_OPTIONS = 500
 MAX_ROUTE_METRICS_PER_ITEM = 5_000
 MAX_DECISION_HISTORY_PER_ITEM = 10_000
+MAX_COMMENT_CHARACTERS = 10_000
 REQUIRED_INERT_CSP = "default-src 'none'; base-uri 'none'; form-action 'none'"
 FORBIDDEN_SECRET_KEYS = {
     "authorization",
@@ -131,6 +144,20 @@ FORBIDDEN_SECRET_KEYS = {
     "refresh_token",
     "session_token",
     "session_id",
+    "session",
+    "sid",
+    "jsessionid",
+    "phpsessid",
+    "asp_net_session_id",
+    "browser_session",
+    "http_session",
+    "browser_session_id",
+    "browser_id",
+    "browser_profile_id",
+    "profile_id",
+    "browser_state",
+    "session_state",
+    "session_url",
     "auth_token",
     "bearer",
     "jwt",
@@ -153,7 +180,14 @@ FORBIDDEN_SECRET_KEYS = {
     "credentials",
     "secret",
     "signature",
+    "headers",
+    "raw_headers",
+    "request_headers",
+    "response_headers",
 }
+FORBIDDEN_SECRET_KEY_SUFFIXES = tuple(
+    "_" + field_name for field_name in sorted(FORBIDDEN_SECRET_KEYS)
+)
 SECRET_VALUE_PATTERNS = (
     re.compile(
         r"(?im)^\s*(?:authorization|proxy-authorization|cookie|set-cookie)\s*:"
@@ -174,9 +208,20 @@ SECRET_VALUE_PATTERNS = (
     re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{12,}\b"),
 )
 URL_ONLY_SECRET_KEYS = {
+    "asp_net_session_id",
     "code",
+    "expires",
+    "hdnea",
+    "hdnts",
+    "hmac",
+    "jsessionid",
+    "key_pair_id",
+    "phpsessid",
+    "policy",
+    "session",
     "sig",
     "signature",
+    "sid",
     "client_assertion",
     "saml_response",
 }
@@ -282,6 +327,112 @@ BIDI_CONTROL_CODEPOINTS = {
     *range(0x2066, 0x206A),
 }
 MAX_DIAGNOSTIC_CHARACTERS = 2_000
+OPERATIONS_V2_FIELD = "operations_v2"
+OPERATIONS_V2_MODULE_NAME = "_paper_finder_operations_v2"
+MAX_OPERATIONS_V2_ERRORS = 50
+MAX_MANIFEST_ERRORS = 500
+MAX_MANIFEST_WARNINGS = 200
+MAX_SECRET_SCAN_NODES = 250_000
+MAX_SECRET_FINDINGS = 100
+MAX_PDF_TERMINAL_STRUCTURE_BYTES = 32 * 1024 * 1024
+MAX_PDF_REVISIONS = 128
+MAX_PDF_STRUCTURAL_OBJECTS = 500_000
+# Cross-reference rows expand into multiple Python objects. Bound the cumulative
+# retained rows independently from compressed/encoded structure bytes.
+MAX_PDF_RETAINED_XREF_ENTRIES = 200_000
+MAX_PDF_DECIMAL_TOKEN_DIGITS = 20
+MAX_PDF_OBJECT_NUMBER = 9_999_999_999
+MAX_PDF_PAGE_COUNT = 10_000_000
+WINDOWS_RESERVED_PATH_BASENAMES = {
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    "conin$",
+    "conout$",
+    *(f"com{index}" for index in range(1, 10)),
+    *(f"lpt{index}" for index in range(1, 10)),
+}
+
+_operations_v2_module: Any | None = None
+
+
+class ManifestDiagnosticLimit(RuntimeError):
+    """Short-circuit validation after a bounded number of safe diagnostics."""
+
+    def __init__(self, diagnostics: list[str]) -> None:
+        super().__init__("manifest diagnostic limit reached")
+        self.diagnostics = diagnostics
+
+
+class CappedDiagnostics(list[str]):
+    def __init__(self, limit: int, label: str, *, stop_at_limit: bool) -> None:
+        super().__init__()
+        self.limit = limit
+        self.label = label
+        self.stop_at_limit = stop_at_limit
+        self.omitted = False
+
+    def append(self, message: str) -> None:
+        if len(self) < self.limit:
+            super().append(message)
+            return
+        if not self.omitted:
+            self.omitted = True
+            super().append(
+                f"additional manifest {self.label} omitted after {self.limit} diagnostics"
+            )
+        if self.stop_at_limit:
+            raise ManifestDiagnosticLimit(list(self))
+
+    def extend(self, messages: Any) -> None:
+        for message in messages:
+            self.append(message)
+
+
+def load_operations_v2_module() -> Any:
+    """Load the trusted sibling state module without consulting ``sys.path``."""
+
+    global _operations_v2_module
+    if _operations_v2_module is not None:
+        return _operations_v2_module
+
+    script_directory = Path(__file__).resolve().parent
+    module_path = script_directory / "paper_finder_state.py"
+    try:
+        if module_path.is_symlink():
+            raise ValueError("the operations-v2 module must not be a symbolic link")
+        resolved_module_path = module_path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("the sibling operations-v2 state module is unavailable") from exc
+    if (
+        resolved_module_path.parent != script_directory
+        or resolved_module_path.name != "paper_finder_state.py"
+        or not resolved_module_path.is_file()
+    ):
+        raise ValueError("the operations-v2 module is not the expected sibling file")
+
+    spec = importlib.util.spec_from_file_location(
+        OPERATIONS_V2_MODULE_NAME,
+        resolved_module_path,
+    )
+    if spec is None or spec.loader is None:
+        raise ValueError("the operations-v2 state module could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise ValueError("the operations-v2 state module failed to initialize") from exc
+    required = ("SCHEMA_VERSION", "new_state", "validate_state")
+    if (
+        getattr(module, "SCHEMA_VERSION", None) != 2
+        or any(not hasattr(module, name) for name in required)
+        or not callable(getattr(module, "new_state", None))
+        or not callable(getattr(module, "validate_state", None))
+    ):
+        raise ValueError("the operations-v2 state module has an incompatible interface")
+    _operations_v2_module = module
+    return module
 
 
 def utc_now() -> str:
@@ -311,6 +462,17 @@ def diagnostic_text(value: Any) -> str:
     return "".join(rendered)
 
 
+def operations_v2_diagnostic(value: Any) -> str:
+    """Render a v2 error without echoing attacker-controlled unknown field names."""
+
+    rendered = diagnostic_text(value)
+    unknown_fields_marker = " has unknown fields:"
+    if unknown_fields_marker in rendered:
+        prefix, _ = rendered.split(unknown_fields_marker, 1)
+        return prefix + " has unknown fields"
+    return rendered
+
+
 def print_cli(
     level: str,
     message: Any,
@@ -329,7 +491,7 @@ def reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"duplicate JSON key is not allowed: {key}")
+            raise ValueError("duplicate JSON key is not allowed")
         result[key] = value
     return result
 
@@ -412,8 +574,19 @@ def normalized_secret_key(value: Any) -> str:
 
 def is_secret_key(value: Any, *, in_url: bool = False) -> bool:
     normalized = normalized_secret_key(value)
+    key_parts = normalized.split("_")
+    browser_state_identifier = bool(
+        key_parts
+        and key_parts[-1] in {"id", "identifier", "state", "url"}
+        and any(
+            part in {"browser", "profile", "session"}
+            for part in key_parts[:-1]
+        )
+    )
     if (
         normalized in FORBIDDEN_SECRET_KEYS
+        or normalized.endswith(FORBIDDEN_SECRET_KEY_SUFFIXES)
+        or browser_state_identifier
         or normalized.startswith("x_amz_")
         or normalized.startswith("x_goog_")
         or normalized.endswith("_access_token")
@@ -426,41 +599,67 @@ def is_secret_key(value: Any, *, in_url: bool = False) -> bool:
     return in_url and normalized in URL_ONLY_SECRET_KEYS
 
 
+def string_contains_secret(value: str) -> bool:
+    if any(pattern.search(value) for pattern in SECRET_VALUE_PATTERNS):
+        return True
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if parsed.username is not None or parsed.password is not None:
+        return True
+    parameter_sources = [parsed.query, parsed.fragment, parsed.params]
+    parameter_sources.extend(
+        segment.split(";", 1)[1]
+        for segment in parsed.path.split("/")
+        if ";" in segment
+    )
+    try:
+        return any(
+            is_secret_key(key, in_url=True) and query_value
+            for source in parameter_sources
+            for key, query_value in parse_qsl(
+                source.replace(";", "&"),
+                keep_blank_values=True,
+            )
+        )
+    except ValueError:
+        return True
+
+
 def secret_locations(value: Any, location: str = "$") -> list[str]:
     findings: list[str] = []
-    if isinstance(value, dict):
-        for key, child in value.items():
-            child_location = f"{location}.{key}"
-            if (
-                is_secret_key(key)
-                and child not in (None, False, "")
-            ):
-                findings.append(child_location)
-            findings.extend(secret_locations(child, child_location))
-    elif isinstance(value, list):
-        for index, child in enumerate(value):
-            findings.extend(secret_locations(child, f"{location}[{index}]"))
-    elif isinstance(value, str):
-        if any(pattern.search(value) for pattern in SECRET_VALUE_PATTERNS):
-            findings.append(location)
-        try:
-            parsed = urlparse(value)
-        except ValueError:
-            parsed = None
-        if parsed and parsed.scheme in {"http", "https"}:
-            if parsed.username is not None or parsed.password is not None:
-                findings.append(location)
-            url_parameters = parse_qsl(
-                parsed.query,
-                keep_blank_values=True,
-            ) + parse_qsl(parsed.fragment, keep_blank_values=True)
-            for key, query_value in url_parameters:
-                if (
-                    is_secret_key(key, in_url=True)
-                    and query_value
+    stack: list[tuple[Any, str, int]] = [(value, location, 0)]
+    scanned = 0
+    while stack:
+        current, current_location, depth = stack.pop()
+        scanned += 1
+        if scanned > MAX_SECRET_SCAN_NODES:
+            findings.append("$<secret-scan-limit>")
+            break
+        if depth > MAX_JSON_NESTING_DEPTH:
+            findings.append(current_location + "<nesting-limit>")
+            break
+        if isinstance(current, dict):
+            for index, (key, child) in enumerate(current.items()):
+                # Mapping keys are untrusted and may themselves contain credentials.
+                # Preserve a useful structural location without copying key text.
+                child_location = f"{current_location}.<field-{index}>"
+                if is_secret_key(key) or (
+                    isinstance(key, str) and string_contains_secret(key)
                 ):
-                    findings.append(location)
-                    break
+                    findings.append(child_location)
+                stack.append((child, child_location, depth + 1))
+        elif isinstance(current, list):
+            for index, child in enumerate(current):
+                stack.append((child, f"{current_location}[{index}]", depth + 1))
+        elif isinstance(current, str) and string_contains_secret(current):
+            findings.append(current_location)
+        if len(findings) >= MAX_SECRET_FINDINGS:
+            findings.append("$<additional-secret-locations>")
+            break
     return sorted(set(findings))
 
 
@@ -530,10 +729,10 @@ def read_titles(path: Path) -> list[str]:
             value = value.get("titles")
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise ValueError("JSON title input must be a string list or an object with a string-list 'titles' field")
-        titles = [item for item in value if item.strip()]
+        titles = [item.strip() for item in value if item.strip()]
     else:
         titles = [
-            line.rstrip("\r\n")
+            line.strip()
             for line in content.splitlines(keepends=True)
             if line.strip()
         ]
@@ -557,6 +756,7 @@ def new_item(index: int, title: str) -> dict[str, Any]:
         "comment": "",
         "candidates": [],
         "selected_candidate_id": None,
+        "selected_version_id": None,
         "pending_action": None,
         "decision_history": [],
     }
@@ -564,6 +764,7 @@ def new_item(index: int, title: str) -> dict[str, Any]:
 
 def new_manifest(titles: list[str]) -> dict[str, Any]:
     timestamp = utc_now()
+    operations_v2 = load_operations_v2_module().new_state(titles)
     return {
         "schema_version": SCHEMA_VERSION,
         "revision": 0,
@@ -572,7 +773,302 @@ def new_manifest(titles: list[str]) -> dict[str, Any]:
         "review_state": "processing",
         "done": False,
         "items": [new_item(index, title) for index, title in enumerate(titles)],
+        OPERATIONS_V2_FIELD: operations_v2,
     }
+
+
+LEGACY_TO_OPERATIONS_V2_REQUEST_STATUS = {
+    "pending": {"pending"},
+    "processing": {"pending"},
+    "retrieved_verified": {"retrieved"},
+    "ambiguous_exact": {"attention"},
+    "relevance_fallback": {"attention"},
+    "authentication_required": {"attention"},
+    "failed_retryable": {"attention"},
+    "not_found": {"failed", "skipped"},
+    "failed_final": {"failed", "skipped"},
+}
+LEGACY_TO_OPERATIONS_V2_STATE_STATUS = {
+    "processing": {"active"},
+    "review_ready": {"review"},
+    # A submitted round is still queued while the review server exits, then becomes
+    # active while the agent applies it. Both are legitimate persisted boundaries.
+    "submitted": {"review", "active"},
+    "done": {"done"},
+}
+OPERATIONS_V2_TERMINAL_HANDOFF_STATUSES = {"resolved", "cancelled"}
+LEGACY_TO_OPERATIONS_V2_DECISION_OUTCOME = {
+    "accepted": "succeeded",
+}
+
+
+def operations_v2_unfinished_handoff_ids(manifest: dict[str, Any]) -> list[str]:
+    state = manifest.get(OPERATIONS_V2_FIELD)
+    if not isinstance(state, dict):
+        return []
+    handoffs = state.get("handoffs")
+    if not isinstance(handoffs, list):
+        return []
+    return [
+        str(handoff.get("id") or f"handoff-{index + 1}")
+        for index, handoff in enumerate(handoffs)
+        if isinstance(handoff, dict)
+        and (
+            not isinstance(handoff.get("status"), str)
+            or handoff.get("status") not in OPERATIONS_V2_TERMINAL_HANDOFF_STATUSES
+        )
+    ]
+
+
+def operations_v2_open_handoff_ids(manifest: dict[str, Any]) -> list[str]:
+    """Compatibility alias for callers predating multi-stage handoff lifecycle."""
+
+    return operations_v2_unfinished_handoff_ids(manifest)
+
+
+def require_operations_v2_for_mutation(
+    manifest: dict[str, Any],
+    operation: str,
+) -> dict[str, Any]:
+    state = manifest.get(OPERATIONS_V2_FIELD)
+    if not isinstance(state, dict):
+        raise ValueError(
+            f"{operation} requires an embedded operations_v2 state; migrate this "
+            "legacy manifest first"
+        )
+    return state
+
+
+def legacy_request_decision_projection(
+    value: Any,
+    *,
+    item_comment: Any,
+    pending: bool,
+) -> Any:
+    """Return the v2 fields represented by a legacy review decision."""
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return value
+    outcome = "queued" if pending else value.get("outcome")
+    if isinstance(outcome, str):
+        outcome = LEGACY_TO_OPERATIONS_V2_DECISION_OUTCOME.get(outcome, outcome)
+    return {
+        "action": value.get("type") or value.get("action"),
+        "candidate_id": value.get("candidate_id"),
+        "version_id": value.get("version_id"),
+        "comment": value.get("comment", item_comment if isinstance(item_comment, str) else ""),
+        "outcome": outcome,
+    }
+
+
+def validate_operations_v2_projection(
+    manifest: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Validate the authoritative v2 state and its legacy item projection.
+
+    Manifests created before operations-v2 remain valid. Once the field exists, it
+    is authoritative and projection mismatches are errors rather than warnings.
+    """
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    if OPERATIONS_V2_FIELD not in manifest:
+        message = (
+            "manifest has no operations_v2 state; v2 handoff and projection checks "
+            "are unavailable"
+        )
+        if manifest.get("schema_version") == LEGACY_SCHEMA_VERSION:
+            warnings.append("legacy " + message)
+        else:
+            errors.append(
+                f"schema_version {SCHEMA_VERSION} requires an embedded operations_v2 state"
+            )
+        return errors, warnings
+    state = manifest.get(OPERATIONS_V2_FIELD)
+    if not isinstance(state, dict):
+        return ["operations_v2 must be an object"], warnings
+    try:
+        module = load_operations_v2_module()
+        state_errors = module.validate_state(state)
+    except Exception:
+        return ["operations_v2 could not be validated safely"], warnings
+    if not isinstance(state_errors, list):
+        return ["operations_v2 validator returned an invalid result"], warnings
+    for state_error in state_errors[:MAX_OPERATIONS_V2_ERRORS]:
+        errors.append(f"operations_v2: {operations_v2_diagnostic(state_error)}")
+    if len(state_errors) > MAX_OPERATIONS_V2_ERRORS:
+        errors.append("operations_v2 has additional validation errors")
+    if state_errors:
+        return errors, warnings
+
+    review_state = manifest.get("review_state")
+    allowed_state_statuses = (
+        LEGACY_TO_OPERATIONS_V2_STATE_STATUS.get(review_state)
+        if isinstance(review_state, str)
+        else None
+    )
+    state_status = state.get("status")
+    if allowed_state_statuses and (
+        not isinstance(state_status, str) or state_status not in allowed_state_statuses
+    ):
+        expected_state_status = " or ".join(sorted(allowed_state_statuses))
+        errors.append(
+            "operations_v2.status must be "
+            f"{expected_state_status} while legacy review_state is {review_state}"
+        )
+
+    items = manifest.get("items")
+    requests = state.get("requests")
+    artifacts = state.get("artifacts")
+    if not isinstance(items, list) or not isinstance(requests, list):
+        return errors, warnings
+    if len(requests) != len(items):
+        errors.append(
+            "operations_v2.requests must contain exactly one projection row per legacy item"
+        )
+        return errors, warnings
+    requests_by_index = {
+        request.get("input_index"): request
+        for request in requests
+        if isinstance(request, dict)
+        and isinstance(request.get("input_index"), int)
+        and not isinstance(request.get("input_index"), bool)
+    }
+    artifacts_by_id = {
+        artifact.get("id"): artifact
+        for artifact in artifacts or []
+        if isinstance(artifact, dict) and isinstance(artifact.get("id"), str)
+    }
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        request = requests_by_index.get(index)
+        label = f"items[{index}]"
+        if request is None:
+            errors.append(f"operations_v2 has no request for {label}")
+            continue
+        if request.get("title") != item.get("requested_title"):
+            errors.append(
+                f"operations_v2 request title does not match {label}.requested_title"
+            )
+        if request.get("comment") != item.get("comment"):
+            errors.append(
+                f"operations_v2 request comment does not match {label}.comment"
+            )
+        if request.get("selected_candidate_id") != item.get("selected_candidate_id"):
+            errors.append(
+                "operations_v2 request selected_candidate_id does not match "
+                f"{label}.selected_candidate_id"
+            )
+        result = item.get("result")
+        selected_version_id = (
+            item.get("selected_version_id")
+            if "selected_version_id" in item
+            else (
+                result.get("selected_version_id")
+                if isinstance(result, dict)
+                else None
+            )
+        )
+        if request.get("selected_version_id") != selected_version_id:
+            errors.append(
+                "operations_v2 request selected_version_id does not match "
+                f"{label}.result"
+            )
+        expected_pending_action = legacy_request_decision_projection(
+            item.get("pending_action"),
+            item_comment=item.get("comment"),
+            pending=True,
+        )
+        if request.get("pending_action") != expected_pending_action:
+            errors.append(
+                f"operations_v2 request pending_action does not match {label}.pending_action"
+            )
+        legacy_history = item.get("decision_history")
+        if isinstance(legacy_history, list):
+            expected_history = [
+                legacy_request_decision_projection(
+                    decision,
+                    item_comment=item.get("comment"),
+                    pending=False,
+                )
+                for decision in legacy_history
+            ]
+            if request.get("decision_history") != expected_history:
+                errors.append(
+                    "operations_v2 request decision_history does not match "
+                    f"{label}.decision_history"
+                )
+        item_status = item.get("status")
+        allowed_statuses = (
+            LEGACY_TO_OPERATIONS_V2_REQUEST_STATUS.get(item_status)
+            if isinstance(item_status, str)
+            else None
+        )
+        request_status = request.get("status")
+        if allowed_statuses and (
+            not isinstance(request_status, str) or request_status not in allowed_statuses
+        ):
+            errors.append(
+                f"operations_v2 request status does not match {label}.status"
+            )
+        if item.get("status") != "retrieved_verified":
+            continue
+        artifact = artifacts_by_id.get(request.get("artifact_id"))
+        if not isinstance(result, dict) or not isinstance(artifact, dict):
+            continue
+        verification = result.get("verification_summary")
+        verification = verification if isinstance(verification, dict) else {}
+        projection_fields = (
+            ("format", result.get("format")),
+            ("verified_url", result.get("verified_url")),
+            ("local_relpath", result.get("local_path")),
+            ("bytes", verification.get("bytes")),
+            ("sha256", verification.get("sha256")),
+        )
+        for artifact_field, legacy_value in projection_fields:
+            if artifact.get(artifact_field) != legacy_value:
+                errors.append(
+                    f"operations_v2 artifact {artifact_field} does not match {label}.result"
+                )
+        if (
+            isinstance(selected_version_id, str)
+            and artifact.get("version_id") != selected_version_id
+        ):
+            errors.append(
+                f"operations_v2 artifact version_id does not match {label}.result"
+            )
+    return errors, warnings
+
+
+def prepare_manifest_for_completion(manifest: dict[str, Any]) -> None:
+    """Move an embedded v2 state to done only when every invariant permits it."""
+
+    state = require_operations_v2_for_mutation(manifest, "finishing")
+    unfinished_handoffs = operations_v2_unfinished_handoff_ids(manifest)
+    if unfinished_handoffs:
+        rendered = ", ".join(unfinished_handoffs[:10])
+        suffix = " …" if len(unfinished_handoffs) > 10 else ""
+        raise ValueError(
+            "resolve or cancel every operations-v2 handoff before finishing: "
+            f"{rendered}{suffix}"
+        )
+    state["status"] = "done"
+    errors, _ = validate_operations_v2_projection(manifest)
+    if errors:
+        raise ValueError("cannot finish batch: " + errors[0])
+
+
+def reopen_manifest_for_review(manifest: dict[str, Any]) -> None:
+    state = require_operations_v2_for_mutation(manifest, "reopening review")
+    manifest["review_state"] = "review_ready"
+    manifest["done"] = False
+    state["status"] = "review"
+    errors, _ = validate_operations_v2_projection(manifest)
+    if errors:
+        raise ValueError("cannot reopen batch: " + errors[0])
 
 
 def safe_http_url(value: Any) -> str | None:
@@ -581,6 +1077,7 @@ def safe_http_url(value: Any) -> str | None:
         or value != value.strip()
         or "\\" in value
         or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        or secret_locations(value)
     ):
         return None
     try:
@@ -696,6 +1193,21 @@ def is_relative_to(path: Path, directory: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def is_portable_path_component(value: Any) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or ":" in value
+        or value.endswith((".", " "))
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    return value.split(".", 1)[0].casefold() not in WINDOWS_RESERVED_PATH_BASENAMES
 
 
 class InertHTMLValidator(HTMLParser):
@@ -1036,6 +1548,9 @@ def inspect_pdf_with_poppler(
     expected_page_count: int,
     expected_title: str,
 ) -> str | None:
+    normalized_expected_title = normalized_title(expected_title)
+    if not normalized_expected_title:
+        return "PDF identity verification requires a title with searchable text"
     pdfinfo = shutil.which("pdfinfo")
     pdftotext = shutil.which("pdftotext")
     if not pdfinfo or not pdftotext:
@@ -1055,10 +1570,23 @@ def inspect_pdf_with_poppler(
         summary = info_output.decode("utf-8", errors="replace").strip()[:500]
         return "PDF parser rejected the artifact" + (f": {summary}" if summary else "")
     info_text = info_output.decode("utf-8", errors="replace")
-    pages_match = re.search(r"(?m)^Pages:\s+([0-9]+)\s*$", info_text)
-    if not pages_match:
+    encryption_states = re.findall(
+        r"(?mi)^Encrypted:\s*(yes|no)\b[^\r\n]*$",
+        info_text,
+    )
+    if len(encryption_states) != 1:
+        return "PDF parser did not report one unambiguous encryption status"
+    if encryption_states[0].casefold() == "yes":
+        return "encrypted PDF artifacts require manual review"
+    page_counts = re.findall(r"(?m)^Pages:\s+([0-9]+)\s*$", info_text)
+    if len(page_counts) != 1:
         return "PDF parser did not report a page count"
-    observed_page_count = int(pages_match.group(1))
+    observed_page_count = _parse_bounded_pdf_decimal(
+        page_counts[0].encode("ascii"),
+        MAX_PDF_PAGE_COUNT,
+    )
+    if observed_page_count is None:
+        return "PDF parser reported an invalid page count"
     if observed_page_count <= 0:
         return "PDF parser reported no pages"
     if observed_page_count != expected_page_count:
@@ -1080,8 +1608,1153 @@ def inspect_pdf_with_poppler(
     extracted_text = text_output.decode("utf-8", errors="replace")
     if len(extracted_text.strip()) < MIN_EXTRACTED_TEXT_CHARACTERS:
         return "PDF does not contain enough extractable text for identity verification"
-    if normalized_title(expected_title) not in normalized_title(extracted_text):
+    if normalized_expected_title not in normalized_title(extracted_text):
         return "PDF extracted text does not contain the selected candidate title"
+    return None
+
+
+PDF_WHITESPACE_BYTES = frozenset(b"\x00\x09\x0a\x0c\x0d\x20")
+
+
+def _skip_pdf_whitespace(data: bytes, position: int) -> int:
+    while position < len(data) and data[position] in PDF_WHITESPACE_BYTES:
+        position += 1
+    return position
+
+
+def _pdf_dictionary_end(data: bytes, start: int) -> int | None:
+    """Return the end of one balanced PDF dictionary without interpreting values."""
+
+    if not data.startswith(b"<<", start):
+        return None
+    depth = 0
+    position = start
+    while position < len(data):
+        if data[position] == ord("%"):
+            newline = data.find(b"\n", position + 1)
+            if newline < 0:
+                return None
+            position = newline + 1
+            continue
+        if data[position] == ord("("):
+            string_depth = 1
+            position += 1
+            while position < len(data) and string_depth:
+                if data[position] == ord("\\"):
+                    position += 2
+                    continue
+                if data[position] == ord("("):
+                    string_depth += 1
+                elif data[position] == ord(")"):
+                    string_depth -= 1
+                position += 1
+            if string_depth:
+                return None
+            continue
+        if data.startswith(b"<<", position):
+            depth += 1
+            position += 2
+            continue
+        if data.startswith(b">>", position):
+            depth -= 1
+            position += 2
+            if depth == 0:
+                return position
+            if depth < 0:
+                return None
+            continue
+        if data[position] == ord("<"):
+            closing = data.find(b">", position + 1)
+            if closing < 0:
+                return None
+            position = closing + 1
+            continue
+        position += 1
+    return None
+
+
+def _is_pdf_whitespace_only(data: bytes) -> bool:
+    return all(value in PDF_WHITESPACE_BYTES for value in data)
+
+
+PDF_NAME_TOKEN_PATTERN = re.compile(
+    rb"/([^\x00\t\n\f\r ()<>\[\]{}/%]+)"
+)
+PDF_NAME_HEX_ESCAPE_PATTERN = re.compile(rb"[0-9A-Fa-f]{2}")
+PDF_XREF_SUBSECTION_HEADER_PATTERN = re.compile(
+    rb"([0-9]+)[ \t]+([0-9]+)[ \t]*(?:\r\n|\r|\n)"
+)
+PDF_XREF_ENTRY_PATTERN = re.compile(
+    rb"([0-9]{10})[ \t]([0-9]{5})[ \t]([nf])"
+    rb"[ \t]*(?:\r\n|\r|\n)"
+)
+PDF_STREAM_HEADER_PATTERN = re.compile(rb"stream[ \t]*(?:\r\n|\r|\n)")
+PDF_DECIMAL_ARRAY_TOKEN_PATTERN = re.compile(rb"[^\x00\t\n\f\r ]+")
+
+
+def _decoded_pdf_name(token: bytes) -> bytes:
+    decoded = bytearray()
+    position = 0
+    while position < len(token):
+        if (
+            token[position] == ord("#")
+            and position + 2 < len(token)
+            and PDF_NAME_HEX_ESCAPE_PATTERN.fullmatch(token[position + 1 : position + 3])
+        ):
+            decoded.append(int(token[position + 1 : position + 3], 16))
+            position += 3
+            continue
+        decoded.append(token[position])
+        position += 1
+    return bytes(decoded)
+
+
+def _decoded_pdf_dictionary_names(dictionary: bytes) -> list[bytes]:
+    return [
+        _decoded_pdf_name(match.group(1))
+        for match in PDF_NAME_TOKEN_PATTERN.finditer(dictionary)
+    ]
+
+
+def _parse_bounded_pdf_decimal(value: bytes, maximum: int) -> int | None:
+    """Parse an untrusted PDF decimal only after bounding its size and value."""
+
+    if (
+        not value
+        or len(value) > MAX_PDF_DECIMAL_TOKEN_DIGITS
+        or any(character < ord("0") or character > ord("9") for character in value)
+        or maximum < 0
+    ):
+        return None
+    normalized = value.lstrip(b"0") or b"0"
+    maximum_bytes = str(maximum).encode("ascii")
+    if len(normalized) > len(maximum_bytes) or (
+        len(normalized) == len(maximum_bytes) and normalized > maximum_bytes
+    ):
+        return None
+    return int(normalized)
+
+
+def _pdf_top_level_dictionary_entries(
+    dictionary: bytes,
+) -> list[tuple[bytes, bytes, bytes]] | None:
+    """Return decoded name, raw name, and value for top-level dictionary keys."""
+
+    if not dictionary.startswith(b"<<") or not dictionary.endswith(b">>"):
+        return None
+    names: list[tuple[bytes, bytes, int, int]] = []
+    dictionary_depth = 1
+    array_depth = 0
+    position = 2
+    outer_end = len(dictionary) - 2
+    while position < outer_end:
+        value = dictionary[position]
+        if value == ord("%"):
+            carriage_return = dictionary.find(b"\r", position + 1, outer_end)
+            line_feed = dictionary.find(b"\n", position + 1, outer_end)
+            endings = [item for item in (carriage_return, line_feed) if item >= 0]
+            if not endings:
+                return None
+            position = min(endings) + 1
+            continue
+        if value == ord("("):
+            string_depth = 1
+            position += 1
+            while position < outer_end and string_depth:
+                if dictionary[position] == ord("\\"):
+                    position += 2
+                    continue
+                if dictionary[position] == ord("("):
+                    string_depth += 1
+                elif dictionary[position] == ord(")"):
+                    string_depth -= 1
+                position += 1
+            if string_depth:
+                return None
+            continue
+        if dictionary.startswith(b"<<", position):
+            dictionary_depth += 1
+            position += 2
+            continue
+        if dictionary.startswith(b">>", position):
+            dictionary_depth -= 1
+            if dictionary_depth <= 0:
+                return None
+            position += 2
+            continue
+        if value == ord("<"):
+            closing = dictionary.find(b">", position + 1, outer_end)
+            if closing < 0:
+                return None
+            position = closing + 1
+            continue
+        if value == ord("["):
+            array_depth += 1
+            position += 1
+            continue
+        if value == ord("]"):
+            if array_depth <= 0:
+                return None
+            array_depth -= 1
+            position += 1
+            continue
+        if value == ord("/") and dictionary_depth == 1 and array_depth == 0:
+            token_start = position + 1
+            token_end = token_start
+            while (
+                token_end < outer_end
+                and dictionary[token_end] not in PDF_TOKEN_BOUNDARY_BYTES
+            ):
+                token_end += 1
+            if token_end == token_start:
+                return None
+            raw_name = dictionary[token_start:token_end]
+            names.append((_decoded_pdf_name(raw_name), raw_name, position, token_end))
+            position = token_end
+            continue
+        position += 1
+    if dictionary_depth != 1 or array_depth != 0:
+        return None
+    result: list[tuple[bytes, bytes, bytes]] = []
+    index = 0
+    while index < len(names):
+        decoded_name, raw_name, _start, token_end = names[index]
+        next_index = index + 1
+        value_end = names[next_index][2] if next_index < len(names) else outer_end
+        if (
+            next_index < len(names)
+            and _is_pdf_whitespace_only(dictionary[token_end:names[next_index][2]])
+        ):
+            # A name object is the current key's value, not another key. Compact
+            # producer output commonly writes /Type/XRef and /Filter/FlateDecode.
+            value_end = names[next_index][3]
+            next_index += 1
+        result.append((decoded_name, raw_name, dictionary[token_end:value_end]))
+        index = next_index
+    return result
+
+
+PDF_XREF_CRITICAL_NAMES = {
+    b"Size",
+    b"Root",
+    b"Prev",
+    b"XRefStm",
+    b"Encrypt",
+    b"Type",
+    b"Length",
+    b"W",
+    b"Index",
+    b"Filter",
+    b"DecodeParms",
+    b"Predictor",
+    b"Columns",
+    b"Colors",
+    b"BitsPerComponent",
+}
+
+
+def _pdf_dictionary_value_map(dictionary: bytes) -> dict[bytes, bytes] | None:
+    entries = _pdf_top_level_dictionary_entries(dictionary)
+    if entries is None:
+        return None
+    values: dict[bytes, bytes] = {}
+    for decoded_name, raw_name, value in entries:
+        if decoded_name in PDF_XREF_CRITICAL_NAMES:
+            if raw_name != decoded_name or decoded_name in values:
+                return None
+            values[decoded_name] = value
+    return values
+
+
+def _pdf_direct_decimal(value: bytes | None, maximum: int) -> int | None:
+    if value is None:
+        return None
+    match = re.fullmatch(rb"\s*([0-9]+)\s*", value)
+    if match is None:
+        return None
+    return _parse_bounded_pdf_decimal(match.group(1), maximum)
+
+
+def _pdf_direct_reference(
+    value: bytes | None,
+) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    match = re.fullmatch(rb"\s*([0-9]+)\s+([0-9]+)\s+R\s*", value)
+    if match is None:
+        return None
+    object_number = _parse_bounded_pdf_decimal(
+        match.group(1), MAX_PDF_OBJECT_NUMBER
+    )
+    generation = _parse_bounded_pdf_decimal(match.group(2), 65_535)
+    if object_number is None or generation is None:
+        return None
+    return object_number, generation
+
+
+def _pdf_direct_decimal_array(
+    value: bytes | None,
+    *,
+    maximum: int,
+    maximum_items: int,
+) -> list[int] | None:
+    if value is None or maximum_items <= 0:
+        return None
+    match = re.fullmatch(rb"\s*\[([^\]]*)\]\s*", value, re.DOTALL)
+    if match is None:
+        return None
+    result: list[int] = []
+    for token_match in PDF_DECIMAL_ARRAY_TOKEN_PATTERN.finditer(
+        value,
+        match.start(1),
+        match.end(1),
+    ):
+        if len(result) >= maximum_items:
+            return None
+        parsed = _parse_bounded_pdf_decimal(token_match.group(0), maximum)
+        if parsed is None:
+            return None
+        result.append(parsed)
+    return result
+
+
+def _pdf_direct_name(value: bytes | None) -> bytes | None:
+    if value is None:
+        return None
+    match = re.fullmatch(
+        rb"\s*/([^\x00\t\n\f\r ()<>\[\]{}/%]+)\s*",
+        value,
+    )
+    return _decoded_pdf_name(match.group(1)) if match is not None else None
+
+
+def _pdf_xref_dictionary_details(dictionary: bytes) -> dict[str, Any] | None:
+    values = _pdf_dictionary_value_map(dictionary)
+    if values is None or b"XRefStm" in values:
+        return None
+    declared_size = _pdf_direct_decimal(
+        values.get(b"Size"), MAX_PDF_STRUCTURAL_OBJECTS
+    )
+    if declared_size is None or declared_size <= 0:
+        return None
+    root = None
+    if b"Root" in values:
+        root = _pdf_direct_reference(values[b"Root"])
+        if root is None:
+            return None
+    previous = None
+    if b"Prev" in values:
+        previous = _pdf_direct_decimal(values[b"Prev"], MAX_PDF_ARTIFACT_BYTES)
+        if previous is None or previous <= 0:
+            return None
+    return {
+        "values": values,
+        "size": declared_size,
+        "root": root,
+        "prev": previous,
+        "encrypted": b"Encrypt" in values,
+    }
+
+
+def _parse_traditional_xref_section(
+    span: bytes,
+    *,
+    maximum_entries: int = MAX_PDF_STRUCTURAL_OBJECTS,
+) -> dict[str, Any] | None:
+    entry_limit = min(maximum_entries, MAX_PDF_STRUCTURAL_OBJECTS)
+    if not span.startswith(b"xref") or entry_limit <= 0:
+        return None
+    position = len(b"xref")
+    subsection_count = 0
+    entries: dict[int, tuple[int, int, int]] = {}
+    while True:
+        position = _skip_pdf_whitespace(span, position)
+        if span.startswith(b"trailer", position):
+            position += len(b"trailer")
+            break
+        header = PDF_XREF_SUBSECTION_HEADER_PATTERN.match(span, position)
+        if header is None:
+            return None
+        subsection_start = _parse_bounded_pdf_decimal(
+            header.group(1), MAX_PDF_OBJECT_NUMBER
+        )
+        entry_count = _parse_bounded_pdf_decimal(
+            header.group(2), MAX_PDF_STRUCTURAL_OBJECTS
+        )
+        if (
+            subsection_start is None
+            or entry_count is None
+            or entry_count <= 0
+            or subsection_start > MAX_PDF_OBJECT_NUMBER - entry_count
+            or entry_count > entry_limit - len(entries)
+        ):
+            return None
+        position = header.end()
+        for entry_index in range(entry_count):
+            entry = PDF_XREF_ENTRY_PATTERN.match(span, position)
+            if entry is None:
+                return None
+            object_number = subsection_start + entry_index
+            if object_number in entries:
+                return None
+            field_one = _parse_bounded_pdf_decimal(
+                entry.group(1), MAX_PDF_ARTIFACT_BYTES
+            )
+            generation = _parse_bounded_pdf_decimal(entry.group(2), 65_535)
+            if field_one is None or generation is None:
+                return None
+            entry_type = 0 if entry.group(3) == b"f" else 1
+            if entry_type == 1 and field_one <= 0:
+                return None
+            if object_number == 0 and (entry_type != 0 or generation != 65_535):
+                return None
+            entries[object_number] = (entry_type, field_one, generation)
+            position = entry.end()
+        subsection_count += 1
+    if subsection_count == 0:
+        return None
+    position = _skip_pdf_whitespace(span, position)
+    dictionary_end = _pdf_dictionary_end(span, position)
+    if dictionary_end is None:
+        return None
+    details = _pdf_xref_dictionary_details(span[position:dictionary_end])
+    if details is None:
+        return None
+    declared_size = details["size"]
+    if any(
+        object_number >= declared_size
+        or (entry[0] == 0 and entry[1] >= declared_size)
+        for object_number, entry in entries.items()
+    ):
+        return None
+    details.update(
+        {
+            "kind": "traditional",
+            "entries": entries,
+            "xref_object": None,
+            "consumed": dictionary_end,
+        }
+    )
+    return details
+
+
+def _parse_traditional_xref_span(
+    span: bytes,
+) -> dict[tuple[int, int], int] | None:
+    section = _parse_traditional_xref_section(span)
+    if section is None or not _is_pdf_whitespace_only(span[section["consumed"] :]):
+        return None
+    return {
+        (object_number, entry[2]): entry[1]
+        for object_number, entry in section["entries"].items()
+        if entry[0] == 1
+    }
+
+
+def _valid_traditional_xref_span(span: bytes) -> bool:
+    return _parse_traditional_xref_span(span) is not None
+
+
+def _bounded_flate_decode(payload: bytes, maximum: int) -> bytes | None:
+    try:
+        decompressor = zlib.decompressobj()
+        decoded = decompressor.decompress(payload, maximum + 1)
+        if len(decoded) > maximum or decompressor.unconsumed_tail:
+            return None
+        remaining = maximum + 1 - len(decoded)
+        if remaining <= 0:
+            return None
+        decoded += decompressor.flush(remaining)
+        if (
+            len(decoded) > maximum
+            or not decompressor.eof
+            or decompressor.unused_data
+            or decompressor.unconsumed_tail
+        ):
+            return None
+        return decoded
+    except (ValueError, zlib.error):
+        return None
+
+
+def _paeth_predictor(left: int, above: int, upper_left: int) -> int:
+    prediction = left + above - upper_left
+    left_distance = abs(prediction - left)
+    above_distance = abs(prediction - above)
+    upper_left_distance = abs(prediction - upper_left)
+    if left_distance <= above_distance and left_distance <= upper_left_distance:
+        return left
+    if above_distance <= upper_left_distance:
+        return above
+    return upper_left
+
+
+def _decode_pdf_predictor(
+    payload: bytes,
+    *,
+    predictor: int,
+    columns: int,
+    rows: int,
+) -> bytes | None:
+    if predictor == 1:
+        return payload if len(payload) == columns * rows else None
+    if predictor == 2:
+        if len(payload) != columns * rows:
+            return None
+        decoded = bytearray(payload)
+        for row_start in range(0, len(decoded), columns):
+            for index in range(row_start + 1, row_start + columns):
+                decoded[index] = (decoded[index] + decoded[index - 1]) & 0xFF
+        return bytes(decoded)
+    if predictor < 10 or predictor > 15 or len(payload) != (columns + 1) * rows:
+        return None
+    decoded = bytearray()
+    previous = bytearray(columns)
+    position = 0
+    for _row in range(rows):
+        filter_type = payload[position]
+        position += 1
+        if filter_type > 4:
+            return None
+        current = bytearray(payload[position : position + columns])
+        position += columns
+        for index in range(columns):
+            left = current[index - 1] if index else 0
+            above = previous[index]
+            upper_left = previous[index - 1] if index else 0
+            if filter_type == 1:
+                current[index] = (current[index] + left) & 0xFF
+            elif filter_type == 2:
+                current[index] = (current[index] + above) & 0xFF
+            elif filter_type == 3:
+                current[index] = (current[index] + ((left + above) // 2)) & 0xFF
+            elif filter_type == 4:
+                current[index] = (
+                    current[index]
+                    + _paeth_predictor(left, above, upper_left)
+                ) & 0xFF
+        decoded.extend(current)
+        previous = current
+    return bytes(decoded)
+
+
+def _parse_xref_stream_section(
+    span: bytes,
+    *,
+    maximum_entries: int = MAX_PDF_STRUCTURAL_OBJECTS,
+) -> dict[str, Any] | None:
+    entry_limit = min(maximum_entries, MAX_PDF_STRUCTURAL_OBJECTS)
+    if entry_limit <= 0:
+        return None
+    object_header = re.match(rb"([0-9]+)\s+([0-9]+)\s+obj\b", span)
+    if object_header is None:
+        return None
+    object_number = _parse_bounded_pdf_decimal(
+        object_header.group(1), MAX_PDF_OBJECT_NUMBER
+    )
+    generation = _parse_bounded_pdf_decimal(object_header.group(2), 65_535)
+    if object_number is None or generation is None:
+        return None
+    position = _skip_pdf_whitespace(span, object_header.end())
+    dictionary_end = _pdf_dictionary_end(span, position)
+    if dictionary_end is None:
+        return None
+    dictionary = span[position:dictionary_end]
+    details = _pdf_xref_dictionary_details(dictionary)
+    if details is None:
+        return None
+    values = details["values"]
+    if _pdf_direct_name(values.get(b"Type")) != b"XRef":
+        return None
+    stream_length = _pdf_direct_decimal(values.get(b"Length"), len(span))
+    widths = _pdf_direct_decimal_array(
+        values.get(b"W"),
+        maximum=8,
+        maximum_items=3,
+    )
+    if stream_length is None or widths is None or len(widths) != 3:
+        return None
+    row_width = sum(widths)
+    if row_width <= 0 or row_width > 24:
+        return None
+    if b"Index" in values:
+        index = _pdf_direct_decimal_array(
+            values[b"Index"],
+            maximum=MAX_PDF_OBJECT_NUMBER,
+            maximum_items=entry_limit * 2,
+        )
+        if index is None:
+            return None
+    else:
+        index = [0, details["size"]]
+    if len(index) == 0 or len(index) % 2:
+        return None
+    object_numbers: list[int] = []
+    seen_numbers: set[int] = set()
+    for pair_index in range(0, len(index), 2):
+        subsection_start, entry_count = index[pair_index : pair_index + 2]
+        if (
+            entry_count <= 0
+            or subsection_start > details["size"] - entry_count
+            or entry_count > entry_limit - len(object_numbers)
+        ):
+            return None
+        subsection_numbers = range(subsection_start, subsection_start + entry_count)
+        if any(item in seen_numbers for item in subsection_numbers):
+            return None
+        object_numbers.extend(subsection_numbers)
+        seen_numbers.update(subsection_numbers)
+    decoded_bytes = len(object_numbers) * row_width
+    if decoded_bytes > MAX_PDF_TERMINAL_STRUCTURE_BYTES:
+        return None
+
+    filter_name = None
+    if b"Filter" in values:
+        filter_name = _pdf_direct_name(values[b"Filter"])
+        if filter_name is None:
+            array_match = re.fullmatch(
+                rb"\s*\[\s*/([^\x00\t\n\f\r ()<>\[\]{}/%]+)\s*\]\s*",
+                values[b"Filter"],
+            )
+            if array_match is None:
+                return None
+            filter_name = _decoded_pdf_name(array_match.group(1))
+        if filter_name not in {b"FlateDecode", b"Fl"}:
+            return None
+    predictor = 1
+    columns = row_width
+    if b"DecodeParms" in values:
+        decode_dictionary = values[b"DecodeParms"].strip()
+        decode_values = _pdf_dictionary_value_map(decode_dictionary)
+        if decode_values is None:
+            return None
+        predictor_value = _pdf_direct_decimal(
+            decode_values.get(b"Predictor", b" 1 "), 15
+        )
+        columns_value = _pdf_direct_decimal(
+            decode_values.get(b"Columns", str(row_width).encode("ascii")),
+            24,
+        )
+        colors_value = _pdf_direct_decimal(
+            decode_values.get(b"Colors", b" 1 "), 8
+        )
+        bits_value = _pdf_direct_decimal(
+            decode_values.get(b"BitsPerComponent", b" 8 "), 16
+        )
+        if (
+            predictor_value is None
+            or columns_value is None
+            or colors_value != 1
+            or bits_value != 8
+        ):
+            return None
+        predictor = predictor_value
+        columns = columns_value
+    if columns != row_width or (filter_name is None and predictor != 1):
+        return None
+
+    position = _skip_pdf_whitespace(span, dictionary_end)
+    stream_header = PDF_STREAM_HEADER_PATTERN.match(span, position)
+    if stream_header is None:
+        return None
+    stream_start = stream_header.end()
+    stream_end = stream_start + stream_length
+    if stream_end > len(span):
+        return None
+    encoded = span[stream_start:stream_end]
+    if filter_name is not None:
+        predicted_bytes = decoded_bytes
+        if 10 <= predictor <= 15:
+            predicted_bytes = len(object_numbers) * (row_width + 1)
+        if predicted_bytes > MAX_PDF_TERMINAL_STRUCTURE_BYTES:
+            return None
+        encoded = _bounded_flate_decode(encoded, predicted_bytes)
+        if encoded is None:
+            return None
+    decoded = _decode_pdf_predictor(
+        encoded,
+        predictor=predictor,
+        columns=columns,
+        rows=len(object_numbers),
+    )
+    if decoded is None or len(decoded) != decoded_bytes:
+        return None
+
+    entries: dict[int, tuple[int, int, int]] = {}
+    data_position = 0
+    for listed_object in object_numbers:
+        fields: list[int] = []
+        for field_index, width in enumerate(widths):
+            if width == 0:
+                fields.append(1 if field_index == 0 else 0)
+                continue
+            field_value = int.from_bytes(
+                decoded[data_position : data_position + width], "big"
+            )
+            data_position += width
+            fields.append(field_value)
+        entry_type, field_one, field_two = fields
+        if entry_type not in {0, 1, 2}:
+            return None
+        if entry_type == 0:
+            if field_one >= details["size"] or field_two > 65_535:
+                return None
+        elif entry_type == 1:
+            if field_one <= 0 or field_one > MAX_PDF_ARTIFACT_BYTES or field_two > 65_535:
+                return None
+        elif field_one >= details["size"]:
+            return None
+        if listed_object == 0 and (entry_type != 0 or field_two not in {0, 65_535}):
+            return None
+        entries[listed_object] = (entry_type, field_one, field_two)
+
+    position = stream_end
+    if span.startswith(b"\r\n", position):
+        position += 2
+    elif position < len(span) and span[position] in {ord("\r"), ord("\n")}:
+        position += 1
+    if not span.startswith(b"endstream", position):
+        return None
+    position = _skip_pdf_whitespace(span, position + len(b"endstream"))
+    if not span.startswith(b"endobj", position):
+        return None
+    position += len(b"endobj")
+    details.update(
+        {
+            "kind": "stream",
+            "entries": entries,
+            "xref_object": (object_number, generation),
+            "consumed": position,
+        }
+    )
+    return details
+
+
+def _parse_xref_stream_span(span: bytes) -> tuple[int, int] | None:
+    section = _parse_xref_stream_section(span)
+    if section is None or not _is_pdf_whitespace_only(span[section["consumed"] :]):
+        return None
+    return section["xref_object"]
+
+
+def _valid_xref_stream_span(span: bytes) -> bool:
+    return _parse_xref_stream_span(span) is not None
+
+
+PDF_HEADER_PATTERN = re.compile(rb"%PDF-[0-9]\.[0-9](?:\r\n|\r|\n)")
+PDF_OBJECT_HEADER_PATTERN = re.compile(
+    rb"([0-9]{1,21})[\x00\x09\x0a\x0c\x0d\x20]+"
+    rb"([0-9]{1,21})[\x00\x09\x0a\x0c\x0d\x20]+obj\b"
+)
+PDF_TOKEN_BOUNDARY_BYTES = PDF_WHITESPACE_BYTES | frozenset(b"()<>[]{}/%")
+
+
+def _skip_pdf_interobject_padding(
+    data: mmap.mmap,
+    position: int,
+    end: int,
+) -> int | None:
+    """Skip only PDF whitespace and complete comments between body objects."""
+
+    while position < end:
+        if data[position] in PDF_WHITESPACE_BYTES:
+            position += 1
+            continue
+        if data[position] != ord("%"):
+            break
+        carriage_return = data.find(b"\r", position + 1, end)
+        line_feed = data.find(b"\n", position + 1, end)
+        line_endings = [
+            offset for offset in (carriage_return, line_feed) if offset >= 0
+        ]
+        if not line_endings:
+            return None
+        newline = min(line_endings)
+        position = newline + 1
+        if (
+            data[newline] == ord("\r")
+            and position < end
+            and data[position] == ord("\n")
+        ):
+            position += 1
+    return position
+
+
+def _find_pdf_keyword(
+    data: mmap.mmap,
+    keyword: bytes,
+    start: int,
+    end: int,
+) -> int | None:
+    position = start
+    while position < end:
+        found = data.find(keyword, position, end)
+        if found < 0:
+            return None
+        before_ok = found == 0 or data[found - 1] in PDF_TOKEN_BOUNDARY_BYTES
+        after = found + len(keyword)
+        after_ok = after >= len(data) or data[after] in PDF_TOKEN_BOUNDARY_BYTES
+        if before_ok and after_ok:
+            return found
+        position = found + 1
+    return None
+
+
+def _parse_pdf_cross_reference_section(
+    data: mmap.mmap,
+    offset: int,
+    maximum_bytes: int,
+    maximum_entries: int,
+) -> dict[str, Any] | None:
+    if (
+        offset <= 0
+        or offset >= len(data)
+        or maximum_bytes <= 0
+        or maximum_entries <= 0
+    ):
+        return None
+    span = data[offset : min(len(data), offset + maximum_bytes)]
+    section = (
+        _parse_traditional_xref_section(span, maximum_entries=maximum_entries)
+        if span.startswith(b"xref")
+        else _parse_xref_stream_section(span, maximum_entries=maximum_entries)
+    )
+    if section is None:
+        return None
+    section["offset"] = offset
+    section["end"] = offset + section["consumed"]
+    return section
+
+
+def _pdf_terminal_after(
+    data: mmap.mmap,
+    position: int,
+    *,
+    expected_startxref: int,
+) -> tuple[int, int] | None:
+    position = _skip_pdf_whitespace(data, position)
+    window = data[position : min(len(data), position + 512)]
+    match = re.match(rb"startxref\s+([0-9]+)\s+%%EOF", window)
+    if match is None:
+        return None
+    declared = _parse_bounded_pdf_decimal(match.group(1), MAX_PDF_ARTIFACT_BYTES)
+    if declared != expected_startxref:
+        return None
+    return position, position + match.end()
+
+
+def _pdf_linearization_details(
+    data: mmap.mmap,
+    observed_bytes: int,
+) -> dict[str, int] | None:
+    header = PDF_HEADER_PATTERN.match(data, 0, min(len(data), 1024))
+    if header is None:
+        return None
+    object_offset = _skip_pdf_interobject_padding(data, header.end(), len(data))
+    if object_offset is None:
+        return None
+    window = data[object_offset : min(len(data), object_offset + 65_536)]
+    object_header = PDF_OBJECT_HEADER_PATTERN.match(window)
+    if object_header is None:
+        return None
+    dictionary_start = _skip_pdf_whitespace(window, object_header.end())
+    dictionary_end = _pdf_dictionary_end(window, dictionary_start)
+    if dictionary_end is None:
+        return None
+    entries = _pdf_top_level_dictionary_entries(
+        window[dictionary_start:dictionary_end]
+    )
+    if entries is None:
+        return None
+    values = {name: value for name, raw_name, value in entries if name == raw_name}
+    linearized = _pdf_direct_decimal(values.get(b"Linearized"), 1)
+    declared_length = _pdf_direct_decimal(values.get(b"L"), MAX_PDF_ARTIFACT_BYTES)
+    main_xref_hint = _pdf_direct_decimal(values.get(b"T"), MAX_PDF_ARTIFACT_BYTES)
+    if linearized != 1 or declared_length != observed_bytes or main_xref_hint is None:
+        return None
+    return {"object_offset": object_offset, "main_xref_hint": main_xref_hint}
+
+
+def _pdf_object_segment_is_valid(
+    data: mmap.mmap,
+    start: int,
+    end: int,
+    expected: tuple[int, int],
+    *,
+    allow_trailing_comments: bool,
+) -> bool:
+    header = PDF_OBJECT_HEADER_PATTERN.match(data, start, end)
+    if header is None:
+        return False
+    object_number = _parse_bounded_pdf_decimal(
+        header.group(1), MAX_PDF_OBJECT_NUMBER
+    )
+    generation = _parse_bounded_pdf_decimal(header.group(2), 65_535)
+    if (object_number, generation) != expected:
+        return False
+    endobj = data.rfind(b"endobj", header.end(), end)
+    while endobj >= 0:
+        before_ok = data[endobj - 1] in PDF_TOKEN_BOUNDARY_BYTES
+        after = endobj + len(b"endobj")
+        after_ok = after >= end or data[after] in PDF_TOKEN_BOUNDARY_BYTES
+        if before_ok and after_ok:
+            break
+        endobj = data.rfind(b"endobj", header.end(), endobj)
+    if endobj < 0:
+        return False
+    padding_start = endobj + len(b"endobj")
+    if allow_trailing_comments:
+        return _skip_pdf_interobject_padding(data, padding_start, end) == end
+    return _is_pdf_whitespace_only(data[padding_start:end])
+
+
+def _pdf_object_is_object_stream(
+    data: mmap.mmap,
+    offset: int,
+    expected: tuple[int, int],
+) -> bool:
+    window = data[offset : min(len(data), offset + 65_536)]
+    header = PDF_OBJECT_HEADER_PATTERN.match(window)
+    if header is None:
+        return False
+    object_number = _parse_bounded_pdf_decimal(
+        header.group(1), MAX_PDF_OBJECT_NUMBER
+    )
+    generation = _parse_bounded_pdf_decimal(header.group(2), 65_535)
+    if (object_number, generation) != expected:
+        return False
+    dictionary_start = _skip_pdf_whitespace(window, header.end())
+    dictionary_end = _pdf_dictionary_end(window, dictionary_start)
+    if dictionary_end is None:
+        return False
+    values = _pdf_dictionary_value_map(window[dictionary_start:dictionary_end])
+    return values is not None and _pdf_direct_name(values.get(b"Type")) == b"ObjStm"
+
+
+def _validate_pdf_byte_coverage(
+    data: mmap.mmap,
+    sections: list[dict[str, Any]],
+    terminals: list[tuple[int, int]],
+) -> bool:
+    object_offsets: dict[int, tuple[int, int]] = {}
+    xref_stream_offsets = {
+        section["offset"]: section["xref_object"]
+        for section in sections
+        if section["xref_object"] is not None
+    }
+    for section in sections:
+        for object_number, entry in section["entries"].items():
+            if entry[0] != 1:
+                continue
+            offset = entry[1]
+            key = (object_number, entry[2])
+            if offset in xref_stream_offsets:
+                if xref_stream_offsets[offset] != key:
+                    return False
+                continue
+            if offset <= 0 or offset >= len(data):
+                return False
+            if offset in object_offsets and object_offsets[offset] != key:
+                return False
+            object_offsets[offset] = key
+
+    entities: list[tuple[int, str, int | tuple[int, int]]] = []
+    for section, terminal in zip(sections, terminals):
+        entities.append((section["offset"], "xref", terminal[1]))
+    for offset, key in object_offsets.items():
+        entities.append((offset, "object", key))
+    entities.sort(key=lambda item: item[0])
+    if not entities or len({item[0] for item in entities}) != len(entities):
+        return False
+    header = PDF_HEADER_PATTERN.match(data, 0, entities[0][0])
+    if header is None:
+        return False
+    first_padding = _skip_pdf_interobject_padding(data, header.end(), entities[0][0])
+    if first_padding != entities[0][0]:
+        return False
+    for index, (start, kind, detail) in enumerate(entities):
+        next_start = entities[index + 1][0] if index + 1 < len(entities) else len(data)
+        if kind == "xref":
+            structural_end = int(detail)
+            if structural_end > next_start:
+                return False
+            if not _is_pdf_whitespace_only(data[structural_end:next_start]):
+                return False
+            continue
+        next_kind = entities[index + 1][1] if index + 1 < len(entities) else "xref"
+        if not _pdf_object_segment_is_valid(
+            data,
+            start,
+            next_start,
+            detail,  # type: ignore[arg-type]
+            allow_trailing_comments=next_kind == "object",
+        ):
+            return False
+    return True
+
+
+def inspect_pdf_terminal_structure(
+    path: Path,
+    *,
+    observed_bytes: int,
+    trailer: bytes,
+) -> str | None:
+    """Validate a complete, bounded PDF revision and cross-reference topology."""
+    terminal = re.search(
+        rb"startxref\s+([0-9]+)\s+%%EOF\s*\Z",
+        trailer,
+    )
+    if terminal is None:
+        return "local PDF artifact does not end with a valid final startxref/EOF sequence"
+    current_xref = _parse_bounded_pdf_decimal(
+        terminal.group(1), max(0, observed_bytes - 1)
+    )
+    if current_xref is None or current_xref <= 0:
+        return "local PDF artifact declares an invalid final cross-reference offset"
+    try:
+        with path.open("rb") as handle:
+            with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                sections: list[dict[str, Any]] = []
+                seen_offsets: set[int] = set()
+                structure_bytes = 0
+                retained_xref_entries = 0
+                next_xref: int | None = current_xref
+                while next_xref is not None:
+                    if next_xref in seen_offsets or len(sections) >= MAX_PDF_REVISIONS:
+                        return "local PDF artifact has a cyclic or excessive Prev chain"
+                    remaining = MAX_PDF_TERMINAL_STRUCTURE_BYTES - structure_bytes
+                    remaining_entries = (
+                        MAX_PDF_RETAINED_XREF_ENTRIES - retained_xref_entries
+                    )
+                    section = _parse_pdf_cross_reference_section(
+                        data,
+                        next_xref,
+                        remaining,
+                        remaining_entries,
+                    )
+                    if section is None:
+                        return (
+                            "local PDF artifact has a malformed or unsupported "
+                            "cross-reference section"
+                        )
+                    structure_bytes += section["consumed"]
+                    section_entry_count = len(section["entries"])
+                    if section_entry_count > remaining_entries:
+                        return (
+                            "local PDF artifact has excessive retained "
+                            "cross-reference entries"
+                        )
+                    retained_xref_entries += section_entry_count
+                    seen_offsets.add(next_xref)
+                    sections.append(section)
+                    previous = section["prev"]
+                    if previous is not None and previous >= observed_bytes:
+                        return "local PDF artifact declares an invalid Prev offset"
+                    next_xref = previous
+
+                if any(
+                    sections[index + 1]["size"] > sections[index]["size"]
+                    for index in range(len(sections) - 1)
+                ):
+                    return "local PDF artifact has an inconsistent Prev/Size chain"
+                forward_links = [
+                    index
+                    for index in range(len(sections) - 1)
+                    if sections[index + 1]["offset"] > sections[index]["offset"]
+                ]
+                linearized = _pdf_linearization_details(data, observed_bytes)
+                is_linearized = (
+                    linearized is not None
+                    and len(sections) == 2
+                    and forward_links == [0]
+                    and abs(
+                        linearized["main_xref_hint"] - sections[1]["offset"]
+                    ) <= 1_024
+                )
+                if forward_links and not is_linearized:
+                    return "local PDF artifact has an inconsistent Prev chain"
+                if not is_linearized and any(
+                    sections[index + 1]["offset"] >= sections[index]["offset"]
+                    for index in range(len(sections) - 1)
+                ):
+                    return "local PDF artifact has an inconsistent Prev chain"
+
+                terminals: list[tuple[int, int]] = []
+                for index, section in enumerate(sections):
+                    expected_startxref = section["offset"]
+                    if is_linearized:
+                        expected_startxref = 0 if index == 0 else current_xref
+                    section_terminal = _pdf_terminal_after(
+                        data,
+                        section["end"],
+                        expected_startxref=expected_startxref,
+                    )
+                    if section_terminal is None:
+                        return (
+                            "local PDF artifact has a malformed or unlinked "
+                            "cross-reference terminal"
+                        )
+                    terminals.append(section_terminal)
+                final_terminal = terminals[1] if is_linearized else terminals[0]
+                if not _is_pdf_whitespace_only(data[final_terminal[1] :]):
+                    return (
+                        "local PDF artifact does not end with a valid final "
+                        "startxref/EOF sequence"
+                    )
+
+                effective: dict[int, tuple[int, int, int]] = {}
+                for section in sections:
+                    for object_number, entry in section["entries"].items():
+                        effective.setdefault(object_number, entry)
+                final_size = sections[0]["size"]
+                if set(effective) != set(range(final_size)):
+                    return (
+                        "local PDF artifact has an incomplete cross-reference chain"
+                    )
+                object_zero = effective.get(0)
+                if (
+                    object_zero is None
+                    or object_zero[0] != 0
+                    or object_zero[2] not in {0, 65_535}
+                ):
+                    return "local PDF artifact has an invalid object-zero entry"
+                root = next(
+                    (section["root"] for section in sections if section["root"] is not None),
+                    None,
+                )
+                if root is None:
+                    return "local PDF artifact cross-reference chain has no Root"
+                root_entry = effective.get(root[0])
+                if root_entry is None or root_entry[0] == 0 or (
+                    root_entry[0] == 1 and root_entry[2] != root[1]
+                ) or (root_entry[0] == 2 and root[1] != 0):
+                    return "local PDF artifact cross-reference Root is invalid"
+                if any(section["encrypted"] for section in sections):
+                    return "encrypted PDF artifacts require manual review"
+                for object_number, entry in effective.items():
+                    if entry[0] != 2:
+                        continue
+                    object_stream = effective.get(entry[1])
+                    if (
+                        object_stream is None
+                        or object_stream[0] != 1
+                        or not _pdf_object_is_object_stream(
+                            data,
+                            object_stream[1],
+                            (entry[1], object_stream[2]),
+                        )
+                    ):
+                        return (
+                            "local PDF artifact has an invalid compressed-object "
+                            "cross-reference entry"
+                        )
+                if not _validate_pdf_byte_coverage(data, sections, terminals):
+                    return (
+                        "local PDF artifact has data outside its complete "
+                        "cross-reference/revision structure"
+                    )
+    except (OSError, ValueError) as exc:
+        return f"could not inspect PDF cross-reference target: {exc}"
     return None
 
 
@@ -1119,19 +2792,30 @@ def verify_local_artifact(
     suffix = path.suffix.lower()
     expects_pdf = format_name == "pdf" or suffix == ".pdf"
     expects_html = format_name in {"html", "htm"} or suffix in {".html", ".htm"}
+    normalized_expected_title = (
+        normalized_title(expected_title)
+        if isinstance(expected_title, str)
+        else None
+    )
 
     if not expects_pdf and not expects_html:
         return f"local artifact must be declared or named as PDF or HTML: {path}"
+    if expected_title is not None and not normalized_expected_title:
+        return "artifact identity verification requires a title with searchable text"
     if expects_pdf and not sample.startswith(b"%PDF-"):
         return f"local artifact is not a recognizable PDF: {path}"
     if expects_pdf and observed_bytes > MAX_PDF_ARTIFACT_BYTES:
         return f"local PDF artifact exceeds the {MAX_PDF_ARTIFACT_BYTES}-byte safety limit"
     if expects_pdf and observed_bytes < 1024:
         return f"local PDF artifact is implausibly small: {path}"
-    if expects_pdf and b"startxref" not in trailer:
-        return f"local PDF artifact has no terminal cross-reference pointer: {path}"
-    if expects_pdf and b"%%EOF" not in trailer:
-        return f"local PDF artifact has no terminal EOF marker: {path}"
+    if expects_pdf:
+        terminal_error = inspect_pdf_terminal_structure(
+            path,
+            observed_bytes=observed_bytes,
+            trailer=trailer,
+        )
+        if terminal_error:
+            return terminal_error
     if expects_pdf:
         if not expected_title:
             return "PDF validation requires the selected candidate title"
@@ -1170,9 +2854,7 @@ def verify_local_artifact(
         body_text = " ".join(validator.body_text_fragments)
         if len(body_text.strip()) < MIN_EXTRACTED_TEXT_CHARACTERS:
             return "local HTML artifact does not contain enough body text for verification"
-        if expected_title and normalized_title(expected_title) not in normalized_title(
-            body_text
-        ):
+        if normalized_expected_title and normalized_expected_title not in normalized_title(body_text):
             return "local HTML artifact body does not contain the selected candidate title"
     try:
         observed_sha256 = sha256_file(path)
@@ -1294,7 +2976,7 @@ def validate_result_evidence(
     errors: list[str],
 ) -> tuple[int | None, str | None]:
     declared_format = result.get("format")
-    if declared_format not in {"pdf", "html"}:
+    if not isinstance(declared_format, str) or declared_format not in {"pdf", "html"}:
         errors.append(f"{label}.format must be pdf or html")
 
     verification = result.get("verification_summary")
@@ -1328,11 +3010,16 @@ def validate_result_evidence(
             errors.append(f"{label}.verification_summary.{field} must be true")
 
     observed_title = verification.get("observed_title")
+    normalized_selected_title = normalized_title(selected_title)
     if not isinstance(observed_title, str) or not observed_title.strip():
         errors.append(
             f"{label}.verification_summary.observed_title must be a non-empty string"
         )
-    elif normalized_title(observed_title) != normalized_title(selected_title):
+    elif not normalized_selected_title:
+        errors.append(
+            f"{label} selected title has no searchable text for identity verification"
+        )
+    elif normalized_title(observed_title) != normalized_selected_title:
         errors.append(
             f"{label}.verification_summary.observed_title must match the selected candidate title"
         )
@@ -1384,19 +3071,30 @@ def validate_result_evidence(
     return expected_bytes, expected_sha256
 
 
-def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], list[str]]:
-    errors: list[str] = []
-    warnings: list[str] = []
+def _validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], list[str]]:
+    errors: list[str] = CappedDiagnostics(
+        MAX_MANIFEST_ERRORS,
+        "errors",
+        stop_at_limit=True,
+    )
+    warnings: list[str] = CappedDiagnostics(
+        MAX_MANIFEST_WARNINGS,
+        "warnings",
+        stop_at_limit=False,
+    )
     if not isinstance(manifest, dict):
         return ["manifest root must be an object"], warnings
     try:
         validate_json_tree(manifest)
     except ValueError as exc:
         return [str(exc)], warnings
-    for location in secret_locations(manifest):
+    secret_findings = secret_locations(manifest)
+    for location in secret_findings:
         errors.append(
             f"credential- or token-like material is not allowed at {location}"
         )
+    if secret_findings:
+        return errors, warnings
 
     required_top = {
         "schema_version",
@@ -1411,8 +3109,15 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
         if field not in manifest:
             errors.append(f"missing top-level field: {field}")
 
-    if manifest.get("schema_version") != SCHEMA_VERSION:
-        errors.append(f"schema_version must be {SCHEMA_VERSION}")
+    root_schema_version = manifest.get("schema_version")
+    if (
+        not isinstance(root_schema_version, int)
+        or isinstance(root_schema_version, bool)
+        or root_schema_version not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}
+    ):
+        errors.append(
+            f"schema_version must be {LEGACY_SCHEMA_VERSION} or {SCHEMA_VERSION}"
+        )
     if (
         not isinstance(manifest.get("revision"), int)
         or isinstance(manifest.get("revision"), bool)
@@ -1422,7 +3127,13 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
     for field in ("created_at", "updated_at"):
         if not is_timestamp_with_timezone(manifest.get(field)):
             errors.append(f"{field} must be an ISO timestamp with timezone")
-    if manifest.get("review_state") not in {"processing", "review_ready", "submitted", "done"}:
+    review_state = manifest.get("review_state")
+    if not isinstance(review_state, str) or review_state not in {
+        "processing",
+        "review_ready",
+        "submitted",
+        "done",
+    }:
         errors.append("review_state must be processing, review_ready, submitted, or done")
     if not isinstance(manifest.get("done"), bool):
         errors.append("done must be a boolean")
@@ -1450,6 +3161,8 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
         "pending_action",
         "decision_history",
     }
+    if root_schema_version == SCHEMA_VERSION:
+        required_item.add("selected_version_id")
 
     for index, item in enumerate(items):
         label = f"items[{index}]"
@@ -1474,14 +3187,18 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
             errors.append(
                 f"{label}.requested_title exceeds {MAX_TITLE_CHARACTERS} characters"
             )
-        if item.get("status") not in STATUSES:
+        item_status = item.get("status")
+        if not isinstance(item_status, str) or item_status not in STATUSES:
             errors.append(f"{label}.status must be one of: {', '.join(sorted(STATUSES))}")
-        if item.get("match_type") not in MATCH_TYPES:
+        item_match_type = item.get("match_type")
+        if not isinstance(item_match_type, str) or item_match_type not in MATCH_TYPES:
             errors.append(f"{label}.match_type must be exact, relevance, or none")
         if not isinstance(item.get("comment"), str):
             errors.append(f"{label}.comment must be a string")
-        elif len(item["comment"]) > 20_000:
-            errors.append(f"{label}.comment exceeds 20,000 characters")
+        elif len(item["comment"]) > MAX_COMMENT_CHARACTERS:
+            errors.append(
+                f"{label}.comment exceeds {MAX_COMMENT_CHARACTERS:,} characters"
+            )
         validate_optional_trace_fields(item, label, errors)
 
         candidates = item.get("candidates")
@@ -1584,20 +3301,41 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
                             )
                     option_candidate = option.get("candidate_id")
                     option_version = option.get("version_id")
-                    if option_candidate not in candidate_ids:
+                    if (
+                        not isinstance(option_candidate, str)
+                        or option_candidate not in candidate_ids
+                    ):
                         errors.append(
                             f"{option_label}.candidate_id does not name a candidate"
                         )
-                    elif option_version not in candidate_versions.get(
-                        str(option_candidate), set()
+                    elif (
+                        not isinstance(option_version, str)
+                        or option_version
+                        not in candidate_versions.get(option_candidate, set())
                     ):
                         errors.append(
                             f"{option_label}.version_id does not name a version on its candidate"
                         )
 
         selected = item.get("selected_candidate_id")
-        if selected is not None and selected not in candidate_ids:
+        if selected is not None and (
+            not isinstance(selected, str) or selected not in candidate_ids
+        ):
             errors.append(f"{label}.selected_candidate_id does not name a candidate")
+        selected_version_on_item = item.get("selected_version_id")
+        if selected_version_on_item is not None:
+            if not isinstance(selected_version_on_item, str) or not selected_version_on_item:
+                errors.append(
+                    f"{label}.selected_version_id must be null or a non-empty string"
+                )
+            elif (
+                not isinstance(selected, str)
+                or selected_version_on_item
+                not in candidate_versions.get(selected, set())
+            ):
+                errors.append(
+                    f"{label}.selected_version_id does not name a version on the selected candidate"
+                )
 
         action = item.get("pending_action")
         if action is not None:
@@ -1608,27 +3346,37 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
                 if not isinstance(action_type, str) or not action_type:
                     errors.append(f"{label}.pending_action.type must be a non-empty string")
                 elif action_type not in ACTIONS:
-                    warnings.append(f"{label}.pending_action.type is a future/unknown action: {action_type}")
+                    warnings.append(
+                        f"{label}.pending_action.type is a future/unknown action"
+                    )
                 if not isinstance(action.get("recorded_at"), str) or not action.get("recorded_at"):
                     errors.append(f"{label}.pending_action.recorded_at must be a non-empty string")
                 candidate_id = action.get("candidate_id")
-                if candidate_id is not None and candidate_id not in candidate_ids:
+                if candidate_id is not None and (
+                    not isinstance(candidate_id, str)
+                    or candidate_id not in candidate_ids
+                ):
                     errors.append(f"{label}.pending_action.candidate_id does not name a candidate")
                 version_id = action.get("version_id")
                 if version_id is not None:
                     if not isinstance(version_id, str) or not version_id:
                         errors.append(f"{label}.pending_action.version_id must be a non-empty string")
-                    elif not candidate_id or version_id not in candidate_versions.get(candidate_id, set()):
+                    elif (
+                        not isinstance(candidate_id, str)
+                        or not candidate_id
+                        or version_id
+                        not in candidate_versions.get(candidate_id, set())
+                    ):
                         errors.append(
                             f"{label}.pending_action.version_id does not name a version on its candidate"
                         )
         if manifest.get("done") and action is not None:
             errors.append(f"{label}.pending_action must be null when the batch is done")
-        if manifest.get("done") and item.get("status") not in {
-            "retrieved_verified",
-            "not_found",
-            "failed_final",
-        }:
+        if manifest.get("done") and (
+            not isinstance(item_status, str)
+            or item_status
+            not in {"retrieved_verified", "not_found", "failed_final"}
+        ):
             errors.append(f"{label}.status must be terminal when the batch is done")
 
         history = item.get("decision_history")
@@ -1641,13 +3389,13 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
             )
 
         result = item.get("result")
-        if result is not None and item.get("status") != "retrieved_verified":
+        if result is not None and item_status != "retrieved_verified":
             errors.append(
                 f"{label}.result is allowed only when status is retrieved_verified"
             )
         if isinstance(result, dict):
             validate_optional_trace_fields(result, f"{label}.result", errors)
-        if item.get("status") == "retrieved_verified":
+        if item_status == "retrieved_verified":
             if not isinstance(result, dict):
                 errors.append(f"{label}.result is required for retrieved_verified")
             else:
@@ -1673,19 +3421,22 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
                     if isinstance(selected_candidate, dict)
                     else None
                 )
-                match_type = item.get("match_type")
+                match_type = item_match_type
                 selected_title = (
                     selected_candidate.get("title")
                     if isinstance(selected_candidate, dict)
                     and isinstance(selected_candidate.get("title"), str)
                     else item.get("requested_title", "")
                 )
-                if match_type not in {"exact", "relevance"}:
+                if not isinstance(match_type, str) or match_type not in {
+                    "exact",
+                    "relevance",
+                }:
                     errors.append(
                         f"{label}.match_type must be exact or relevance for retrieved_verified"
                     )
                 if match_type == "exact":
-                    if relationship not in {
+                    if not isinstance(relationship, str) or relationship not in {
                         "title_match",
                         "version_of_title_match",
                     }:
@@ -1697,7 +3448,11 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
                         if isinstance(selected_candidate, dict)
                         else None
                     )
-                    if title_match_type not in {"verbatim", "normalized", "expanded"}:
+                    if not isinstance(title_match_type, str) or title_match_type not in {
+                        "verbatim",
+                        "normalized",
+                        "expanded",
+                    }:
                         errors.append(
                             f"{label} exact success requires verbatim, normalized, or expanded title evidence"
                         )
@@ -1716,6 +3471,13 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
                         f"{label} relevance success must select a relevance_fallback candidate"
                     )
                 selected_version = result.get("selected_version_id")
+                if (
+                    "selected_version_id" in item
+                    and selected_version != selected_version_on_item
+                ):
+                    errors.append(
+                        f"{label}.result.selected_version_id must match the item selection"
+                    )
                 if selected_version is not None and (
                     not isinstance(selected_version, str)
                     or selected_version
@@ -1762,11 +3524,14 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
                                 errors.append(
                                     f"{label} selected version must be classified as version_of_title_match"
                                 )
-                            if selected_version_entry.get("title_match_type") not in {
-                                "verbatim",
-                                "normalized",
-                                "expanded",
-                            }:
+                            selected_version_title_match_type = (
+                                selected_version_entry.get("title_match_type")
+                            )
+                            if (
+                                not isinstance(selected_version_title_match_type, str)
+                                or selected_version_title_match_type
+                                not in {"verbatim", "normalized", "expanded"}
+                            ):
                                 errors.append(
                                     f"{label} selected version requires verbatim, normalized, or expanded title evidence"
                                 )
@@ -1824,11 +3589,19 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
                             f"{label}.result.retrieval_url must match artifact_discovery.artifact_url"
                         )
                     discovery_method = artifact_discovery.get("method")
+                    if discovery_method == "other":
+                        errors.append(
+                            f"{label}.artifact_discovery.method other is review-only and cannot establish retrieved success"
+                        )
                     discovered_from_key = canonical_url_key(
                         artifact_discovery.get("discovered_from")
                     )
                     if (
-                        discovery_method not in {"collection_index", "repository_metadata"}
+                        (
+                            not isinstance(discovery_method, str)
+                            or discovery_method
+                            not in DISCOVERY_METHODS_WITH_DISTINCT_DECLARING_URL
+                        )
                         and verified_key is not None
                         and discovered_from_key is not None
                         and discovered_from_key != verified_key
@@ -1894,14 +3667,20 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
                     errors.append(
                         f"{label}.result.provenance.source_role must be official_collection for collection_index discovery"
                     )
+                provenance_source_role = (
+                    provenance.get("source_role")
+                    if isinstance(provenance, dict)
+                    else None
+                )
                 if (
                     isinstance(artifact_discovery, dict)
                     and artifact_discovery.get("method") == "repository_metadata"
                     and isinstance(provenance, dict)
-                    and provenance.get("source_role") not in {
-                        "official_repository",
-                        "author_repository",
-                    }
+                    and (
+                        not isinstance(provenance_source_role, str)
+                        or provenance_source_role
+                        not in {"official_repository", "author_repository"}
+                    )
                 ):
                     errors.append(
                         f"{label}.result.provenance.source_role must identify the repository for repository_metadata discovery"
@@ -1917,6 +3696,10 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
                         or ".." in relative_path.parts
                         or not relative_path.parts
                         or relative_path.parts[0] != "papers"
+                        or not all(
+                            is_portable_path_component(part)
+                            for part in relative_path.parts
+                        )
                     ):
                         errors.append(
                             f"{label}.result.local_path must be a relative path under papers/"
@@ -1960,8 +3743,12 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
                                     errors.append(f"{label}: {artifact_error}")
 
         failure = item.get("failure")
-        if item.get("status") in {"failed_retryable", "failed_final"} and not isinstance(failure, dict):
-            errors.append(f"{label}.failure is required for {item.get('status')}")
+        if (
+            isinstance(item_status, str)
+            and item_status in {"failed_retryable", "failed_final"}
+            and not isinstance(failure, dict)
+        ):
+            errors.append(f"{label}.failure is required for a failed item")
         if failure is not None:
             if not isinstance(failure, dict):
                 errors.append(f"{label}.failure must be an object when present")
@@ -1977,12 +3764,12 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
                     )
                 if not isinstance(failure.get("retryable"), bool):
                     errors.append(f"{label}.failure.retryable must be a boolean")
-                elif item.get("status") == "failed_retryable" and not failure["retryable"]:
+                elif item_status == "failed_retryable" and not failure["retryable"]:
                     errors.append(f"{label}.failure.retryable must be true for failed_retryable")
-                elif item.get("status") == "failed_final" and failure["retryable"]:
+                elif item_status == "failed_final" and failure["retryable"]:
                     errors.append(f"{label}.failure.retryable must be false for failed_final")
 
-        if item.get("match_type") == "relevance" and item.get("status") == "retrieved_verified":
+        if item_match_type == "relevance" and item_status == "retrieved_verified":
             selected_result_version = (
                 result.get("selected_version_id")
                 if isinstance(result, dict)
@@ -1996,14 +3783,30 @@ def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], li
                 and decision.get("version_id") == selected_result_version
                 and decision.get("outcome") == "accepted"
                 and is_timestamp_with_timezone(decision.get("applied_at"))
-                for decision in history or []
+                for decision in (history if isinstance(history, list) else [])
             )
             if not accepted:
                 errors.append(
                     f"{label} is a relevance result without a complete applied accept_fallback decision"
                 )
 
+    operations_errors, operations_warnings = validate_operations_v2_projection(manifest)
+    errors.extend(operations_errors)
+    warnings.extend(operations_warnings)
     return errors, warnings
+
+
+def validate_manifest(manifest: Any, manifest_path: Path) -> tuple[list[str], list[str]]:
+    """Validate untrusted manifest data without propagating shape/type failures."""
+
+    try:
+        return _validate_manifest(manifest, manifest_path)
+    except ManifestDiagnosticLimit as exc:
+        return exc.diagnostics, []
+    except Exception:
+        # JSON-shaped wrong types must fail closed at the validation boundary. Do
+        # not include exception text: it may contain attacker-controlled values.
+        return ["manifest contains an invalid value type or structure"], []
 
 
 def print_validation(errors: list[str], warnings: list[str]) -> None:
@@ -2070,7 +3873,7 @@ REVIEW_HTML = """<!doctype html>
 <body>
   <header>
     <h1>Paper Finder Batch Review</h1>
-    <p>Review the completed pass, record decisions together, then apply them in one round.</p>
+    <p>This page records decisions for Codex; it does not search or download by itself.</p>
   </header>
   <main>
     <div id="summary" class="summary"></div>
@@ -2084,9 +3887,9 @@ REVIEW_HTML = """<!doctype html>
         Action
         <select id="bulk-action">
           <option value="">Choose an action…</option>
-          <option value="retry">Retry</option>
-          <option value="retry_authenticated">Retry after sign-in</option>
-          <option value="retry_public">Retry public sources only</option>
+          <option value="retry">Queue another search round</option>
+          <option value="retry_authenticated">I’ve signed in — queue authenticated search</option>
+          <option value="retry_public">Queue a public-source search</option>
           <option value="skip">Skip</option>
           <option value="stop_retrying">Stop retrying</option>
         </select>
@@ -2095,8 +3898,8 @@ REVIEW_HTML = """<!doctype html>
     </section>
     <div id="items"></div>
     <div class="batch-actions">
-      <button id="apply" class="primary">Apply decisions</button>
-      <button id="done" class="danger">Done</button>
+      <button id="apply" class="primary">Submit queued actions to Codex</button>
+      <button id="done" class="danger">Finish batch</button>
     </div>
     <div id="message" role="status" aria-live="polite"></div>
   </main>
@@ -2334,7 +4137,7 @@ REVIEW_HTML = """<!doctype html>
           : item.pending_action?.candidate_id ?? item.selected_candidate_id ?? null,
         version_id: hasDraftVersion
           ? draft.version_id
-          : item.pending_action?.version_id ?? null
+          : item.pending_action?.version_id ?? item.selected_version_id ?? null
       };
     }
 
@@ -2438,9 +4241,9 @@ REVIEW_HTML = """<!doctype html>
 
     function actionOptions(item) {
       const values = [
-        ["retry", "Retry"],
-        ["retry_authenticated", "Retry after sign-in"],
-        ["retry_public", "Retry public sources only"],
+        ["retry", "Queue another search round"],
+        ["retry_authenticated", "I’ve signed in — queue authenticated search"],
+        ["retry_public", "Queue a public-source search"],
         ["skip", "Skip"],
         ["stop_retrying", "Stop retrying"]
       ];
@@ -2465,7 +4268,8 @@ REVIEW_HTML = """<!doctype html>
       const candidate = document.querySelector(`input[name="candidate-${CSS.escape(item.id)}"]:checked`);
       const selection = radioDecisionSelection(candidate);
       const action = select.value;
-      if (["select_candidate", "accept_fallback"].includes(action) && !candidate) {
+      const isCandidateAction = ["select_candidate", "accept_fallback"].includes(action);
+      if (isCandidateAction && !candidate) {
         showMessage("Select a candidate before saving this action.", true);
         return;
       }
@@ -2477,8 +4281,8 @@ REVIEW_HTML = """<!doctype html>
           body: JSON.stringify({
             expected_revision: manifest.revision,
             action,
-            candidate_id: selection.candidate_id,
-            version_id: selection.version_id,
+            candidate_id: isCandidateAction ? selection.candidate_id : null,
+            version_id: isCandidateAction ? selection.version_id : null,
             comment: textarea.value
           })
         });
@@ -2521,7 +4325,7 @@ REVIEW_HTML = """<!doctype html>
         ? ` ${protectedCount} existing per-item override${protectedCount === 1 ? "" : "s"} will be left unchanged.`
         : "";
       if (!window.confirm(
-        `Stage “${actionLabel}” for ${targets.length} visible needs-attention item${targets.length === 1 ? "" : "s"}?${preservationNote} This only stages decisions; Apply decisions is still required.`
+        `Stage “${actionLabel}” for ${targets.length} visible needs-attention item${targets.length === 1 ? "" : "s"}?${preservationNote} This only stages decisions; submitting queued actions is still required.`
       )) {
         return;
       }
@@ -2546,7 +4350,7 @@ REVIEW_HTML = """<!doctype html>
           showMessage(`Staging bulk decisions: ${staged} of ${targets.length} saved…`);
         }
         showMessage(
-          `Staged “${actionLabel}” for ${staged} item${staged === 1 ? "" : "s"}. Review or override individual items, then click Apply decisions.`
+          `Staged “${actionLabel}” for ${staged} item${staged === 1 ? "" : "s"}. Review or override individual items, then submit queued actions to Codex.`
         );
       } catch (error) {
         showMessage(
@@ -2616,6 +4420,7 @@ REVIEW_HTML = """<!doctype html>
         select.append(option);
       });
       const textarea = document.createElement("textarea");
+      textarea.maxLength = 10000;
       textarea.placeholder = "Optional comment or retry hint — never paste passwords, cookies, tokens, or one-time codes";
       textarea.value = draft?.comment ?? item.pending_action?.comment ?? item.comment ?? "";
       const save = node("button", item.pending_action ? "Update decision" : "Save decision");
@@ -2698,8 +4503,8 @@ REVIEW_HTML = """<!doctype html>
           body: JSON.stringify({action, expected_revision: manifest.revision})
         });
         showMessage(action === "apply"
-          ? "Decisions submitted. The review server is stopping for the next retrieval round."
-          : "Batch marked Done. The review server is stopping.");
+          ? "Queued actions submitted to Codex. No search was started by this page; the review server is stopping for the next agent-run round."
+          : "Batch marked finished. The review server is stopping.");
       } catch (error) {
         showMessage(error.message, true);
         setDecisionControlsDisabled(false);
@@ -3168,8 +4973,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
             raise ValueError("version_id must be a string or null")
         if not isinstance(comment, str):
             raise ValueError("comment must be a string")
-        if len(comment) > 20_000:
-            raise ValueError("comment exceeds 20,000 characters")
+        if len(comment) > MAX_COMMENT_CHARACTERS:
+            raise ValueError(
+                f"comment exceeds {MAX_COMMENT_CHARACTERS:,} characters"
+            )
         reject_secrets({"comment": comment})
 
         with self.server.state_lock:
@@ -3177,9 +4984,20 @@ class ReviewHandler(BaseHTTPRequestHandler):
             manifest = copy.deepcopy(self.server.manifest)
             if manifest.get("done") or manifest.get("review_state") != "review_ready":
                 raise ValueError("the review round is no longer accepting item decisions")
-            item = next((entry for entry in manifest.get("items", []) if entry.get("id") == item_id), None)
-            if item is None:
+            operations_state = require_operations_v2_for_mutation(
+                manifest, "queuing review decisions"
+            )
+            located_item = next(
+                (
+                    (index, entry)
+                    for index, entry in enumerate(manifest.get("items", []))
+                    if isinstance(entry, dict) and entry.get("id") == item_id
+                ),
+                None,
+            )
+            if located_item is None:
                 raise ValueError(f"unknown item id: {item_id}")
+            item_index, item = located_item
             candidate_map = {
                 candidate.get("id"): candidate
                 for candidate in item.get("candidates", [])
@@ -3189,8 +5007,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
             if action in {"select_candidate", "accept_fallback"}:
                 if not candidate_id or candidate_id not in candidate_ids:
                     raise ValueError("this action requires a candidate from the item")
-            elif candidate_id is not None and candidate_id not in candidate_ids:
-                raise ValueError("candidate_id does not name a candidate on this item")
+            elif candidate_id is not None or version_id is not None:
+                raise ValueError(
+                    "candidate_id and version_id are only allowed for candidate actions"
+                )
             if version_id is not None:
                 if not candidate_id:
                     raise ValueError("version_id requires candidate_id")
@@ -3222,6 +5042,31 @@ class ReviewHandler(BaseHTTPRequestHandler):
             else:
                 pending_action.pop("comment", None)
             item["pending_action"] = pending_action
+            operations_requests = operations_state.get("requests")
+            operations_request = next(
+                (
+                    request
+                    for request in operations_requests or []
+                    if isinstance(request, dict)
+                    and request.get("input_index") == item_index
+                ),
+                None,
+            )
+            if operations_request is None:
+                raise ValueError(
+                    "operations-v2 has no authoritative request for this item"
+                )
+            operations_request["comment"] = comment
+            operations_request["pending_action"] = legacy_request_decision_projection(
+                pending_action,
+                item_comment=comment,
+                pending=True,
+            )
+            projection_errors, _ = validate_operations_v2_projection(manifest)
+            if projection_errors:
+                raise ValueError(
+                    "cannot queue an inconsistent decision: " + projection_errors[0]
+                )
             save_manifest(self.server.manifest_path, manifest)
             self.server.manifest = manifest
         self.send_json(200, {"manifest": manifest})
@@ -3235,9 +5080,12 @@ class ReviewHandler(BaseHTTPRequestHandler):
             manifest = copy.deepcopy(self.server.manifest)
             if manifest.get("done") or manifest.get("review_state") != "review_ready":
                 raise ValueError("the review round is no longer accepting batch actions")
+            require_operations_v2_for_mutation(manifest, "submitting review actions")
             if action == "apply":
                 if not any(item.get("pending_action") for item in manifest.get("items", [])):
-                    raise ValueError("record at least one item decision before applying")
+                    raise ValueError(
+                        "record at least one item decision before submitting queued actions"
+                    )
                 manifest["review_state"] = "submitted"
                 manifest["done"] = False
             else:
@@ -3248,7 +5096,7 @@ class ReviewHandler(BaseHTTPRequestHandler):
                 ]
                 if pending:
                     raise ValueError(
-                        "apply all pending decisions before Done: "
+                        "submit and process all pending decisions before Done: "
                         + ", ".join(str(item_id) for item_id in pending)
                     )
                 unfinished = [
@@ -3263,6 +5111,15 @@ class ReviewHandler(BaseHTTPRequestHandler):
                     )
                 manifest["review_state"] = "done"
                 manifest["done"] = True
+                prepare_manifest_for_completion(manifest)
+                completion_errors, _ = validate_manifest(
+                    manifest,
+                    self.server.manifest_path,
+                )
+                if completion_errors:
+                    raise ValueError(
+                        "cannot finish invalid batch: " + completion_errors[0]
+                    )
             save_manifest(self.server.manifest_path, manifest)
             self.server.manifest = manifest
             self.server.last_batch_action = action
@@ -3335,10 +5192,19 @@ def cmd_export(args: argparse.Namespace) -> int:
         print_validation(errors, warnings)
         if errors:
             return 1
+        require_operations_v2_for_mutation(manifest, "final export")
         if not manifest.get("done"):
             print_cli(
                 "ERROR",
                 "Final HTML export requires a batch marked Done",
+                error=True,
+            )
+            return 1
+        unfinished_handoffs = operations_v2_unfinished_handoff_ids(manifest)
+        if unfinished_handoffs:
+            print_cli(
+                "ERROR",
+                "Final HTML export requires every operations-v2 handoff to be closed",
                 error=True,
             )
             return 1
@@ -3375,6 +5241,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print_validation(errors, warnings)
         if errors:
             return 1
+        require_operations_v2_for_mutation(manifest, "serving review")
         if manifest.get("done") and not args.reopen:
             print_cli(
                 "ERROR",
@@ -3382,6 +5249,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
                 error=True,
             )
             return 1
+        if manifest.get("done") and args.reopen:
+            reopen_manifest_for_review(manifest)
+            save_manifest(manifest_path, manifest)
         unfinished = [
             item.get("id")
             for item in manifest.get("items", [])
@@ -3399,6 +5269,15 @@ def cmd_serve(args: argparse.Namespace) -> int:
         print_cli("ERROR", exc, error=True)
         return 1
 
+    unfinished_handoffs = operations_v2_unfinished_handoff_ids(manifest)
+    if unfinished_handoffs:
+        print_cli(
+            "INFO",
+            f"Review includes {len(unfinished_handoffs)} unfinished operations-v2 "
+            "handoff(s); "
+            "Finish batch remains blocked until each is resolved or cancelled.",
+        )
+
     token = secrets.token_urlsafe(24)
     try:
         server = ReviewServer(
@@ -3413,6 +5292,16 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         manifest["done"] = False
         manifest["review_state"] = "review_ready"
+        operations_state = require_operations_v2_for_mutation(
+            manifest, "serving review"
+        )
+        operations_state["status"] = "review"
+        projection_errors, _ = validate_operations_v2_projection(manifest)
+        if projection_errors:
+            raise ValueError(
+                "could not enter review with an inconsistent projection: "
+                + projection_errors[0]
+            )
         save_manifest(manifest_path, manifest)
     except (OSError, ValueError) as exc:
         server.server_close()
@@ -3423,7 +5312,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     print_cli("OK", f"Review interface: {url}", flush=True)
     print_cli(
         "INFO",
-        "The server exits when the user applies decisions or clicks Done.",
+        "This page only queues decisions. The server exits after queued actions are "
+        "submitted to Codex or the batch is finished.",
         flush=True,
     )
     try:

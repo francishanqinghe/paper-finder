@@ -1,113 +1,336 @@
 # Batch Contract
 
+## Contents
+
+- [Complete a full pass](#complete-a-full-pass)
+- [Manifest envelope](#manifest-envelope)
+- [Legacy item representation](#legacy-item-representation)
+- [Discovery traces and success evidence](#discovery-traces-and-success-evidence)
+- [Bounded artifact validation](#bounded-artifact-validation)
+- [Actual v2 bridge](#actual-v2-bridge)
+- [Honest review queue](#honest-review-queue)
+- [Completion invariant](#completion-invariant)
+
 ## Complete a full pass
 
-- Preserve input order and assign each requested title a stable item ID.
-- Process every title through discovery, selection, retrieval, and verification as far as possible.
-- Do not interrupt the first pass for item-level choices, sign-in requests, comments, or retries.
-- Aggregate all required decisions after the full pass and present them together.
-- Continue in review-and-retry rounds until the user clicks **Done**.
+- Preserve every accepted, trimmed input title and its order, including
+  duplicates.
+- Initialize the full batch before discovery and continue after ambiguity, access
+  failure, retrieval failure, and verification failure.
+- Do not interrupt the first pass for per-item choices. Present all review actions
+  together, apply the submitted set in the active Codex process, and repeat.
+- Before adding an item to that review set, exhaust its applicable bounded
+  identifier-location and public transfer routes and record their outcomes.
+- Treat a single title as a one-item batch.
 
-## Use the manifest as state
+## Manifest envelope
 
-- Store the authoritative batch state in `manifest.json`.
-- Include these top-level fields:
-  - `schema_version`
-  - `revision`
-  - `created_at`
-  - `updated_at`
-  - `review_state`
-  - `done`
-  - `items`
-- Include these fields on every item:
-  - `id`
-  - `requested_title`
-  - `status`
-  - `match_type`
-  - `comment`
-  - `candidates`
-  - `selected_candidate_id`
-  - `pending_action`
-  - `decision_history`
-- Add `result` after successful retrieval and add `failure` when a retrieval attempt fails.
-- Increment the nonnegative integer `revision` on every saved change. Review submissions must include the revision they were based on; reject stale or externally modified state instead of overwriting it.
-- Treat every manifest field as untrusted data. Never store credentials, cookies, authorization headers, one-time codes, session tokens, private keys, or secret-bearing URLs anywhere in the manifest, including comments and provenance. Secret-pattern scanning is defense in depth, not proof that arbitrary text is secret-free.
-- Treat `artifact_discovery` and `route_metrics` as canonical item-level fields. Existing manifests may omit them; new processing must retain them at item level so failed or retryable items do not depend on a `result` object.
-- Add `artifact_discovery` when an artifact link is discovered:
-  - `method`: `registry_metadata`, `html_metadata`, `structured_data`, `embedded_document`, `download_link`, `repository_metadata`, `collection_index`, `user_supplied`, or `other`
-  - `discovered_from`: the authoritative page, record, or collection index that declared the artifact
-  - `artifact_url`: the resolved artifact URL
-  - `evidence`: the observed metadata field, structured-data property, element/link description, or repository record
-- Add `route_metrics` as an array whenever discovery, retrieval, or verification is attempted, with one entry per attempt. Require `phase` (`discovery`, `retrieval`, or `verification`), `method`, and `outcome`. Add `access_mode`, `url`, `request_count`, `redirect_count`, `bytes`, `elapsed_ms`, or `http_status` only when measured.
-- Keep discovery, retrieval, and verification attempts in separate `route_metrics` entries. Do not estimate missing values, populate placeholders, or count `user_supplied` links as autonomous discovery.
-- Permit extra fields at every level so later policy revisions remain backward-compatible.
+`scripts/paper_finder_batch.py` initializes manifest-envelope schema version `2`
+and accepts historical envelope schema version `1`. Both versions require these
+root fields:
 
-## Use stable MVP states
+```text
+schema_version: 1 or 2
+revision
+created_at
+updated_at
+review_state
+done
+items
+```
 
-- Set `status` to one of:
-  - `pending`
-  - `processing`
-  - `retrieved_verified`
-  - `ambiguous_exact`
-  - `relevance_fallback`
-  - `authentication_required`
-  - `failed_retryable`
-  - `not_found`
-  - `failed_final`
-- Set `match_type` to `exact`, `relevance`, or `none`.
-- Use `pending` and `processing` only before an item reaches a stable first-pass or retry outcome.
-- Treat `retrieved_verified` as success only when the selected candidate, verified canonical URL, local artifact, artifact-discovery evidence, and a verification-phase route record all exist and agree.
-- Use only safe public HTTPS URLs in persisted candidates, discovery evidence, route records, and results. Never persist URL credentials, signed download parameters, fragments containing authorization state, private/internal hostnames, IP literals, or HTTPS-to-HTTP downgrades.
-- Store successful artifacts only as relative paths beneath the batch `papers/` directory. Reject absolute paths, parent traversal, and symbolic links.
-- Require `result.selected_candidate_id`, `result.format`, `result.verified_url`, `result.retrieval_url`, `result.local_path`, `result.verification_summary`, and `result.provenance` for every success. Add `result.selected_version_id` when selecting a declared version.
-- Require `result.verified_url` to match the selected candidate's source URL, or the selected version's source URL when a version is selected. Require `result.retrieval_url` to match `artifact_discovery.artifact_url` after canonicalization.
-- For direct discovery methods, require `artifact_discovery.discovered_from` to match the verified canonical URL. Permit a different declaring URL only for `collection_index` or `repository_metadata`, with the corresponding `official_collection`, `official_repository`, or `author_repository` provenance role.
-- Require `result.verification_summary.bytes`, lowercase `sha256`, `observed_title`, `verification_method`, `identity_evidence`, `full_text_evidence`, timezone-aware `verified_at`, `identity_verified: true`, `full_text_verified: true`, and `artifact_integrity_verified: true`. Recompute the size and digest from the local artifact during validation, and bind `observed_title` to the effective selected candidate or version.
-- Require `result.verification_summary.page_count` for PDF and `sanitized_inert_snapshot: true` for HTML.
-- Require `result.provenance.method` and `result.provenance.source_role`. Use one of `publisher`, `issuing_organization`, `official_repository`, `official_collection`, `trusted_registry`, `author_repository`, or `other_legitimate_source`. Retain only non-secret provenance; never retain response headers, cookies, authorization material, browser-session state, or secret-bearing URLs.
-- Require at least one `route_metrics` verification entry with `outcome: passed` and a measured byte count matching the local artifact. Any URL on that verification record must match the verified or retrieved source.
-- Require PDF artifacts to stay within the configured size limit and pass bounded Poppler `pdfinfo` and `pdftotext` inspection. The independently observed page count must match the manifest, extracted text must contain the selected title, and sufficient text must exist to reject placeholders and unreadable files.
-- Require HTML to be a newly sanitized strict UTF-8 document with one doctype, one `html`/`head`/`body` structure, `<meta charset="utf-8">`, and `default-src 'none'; base-uri 'none'; form-action 'none'` as the exact second head element. Bound nodes, attributes, depth, and text; allow no scripts, forms, frames, embedded objects, comments, event handlers, duplicate attributes, refreshes, remote loads, or external anchor destinations. Preserve external link text, but strip its `href`; allow only same-document fragment links. Its body—not only its metadata—must contain the selected title and sufficient source text.
-- Use `failure` to retain a machine-readable code, user-facing message, and retryability when available.
-- Do not store a standalone `failure.sign_in_url`. Direct sign-in only through an independently verified selected-candidate source URL shown with its full hostname.
+`revision` is a nonnegative integer; timestamps include a timezone;
+`review_state` is `processing`, `review_ready`, `submitted`, or `done`; and `done`
+is a boolean consistent with that state. `schema_version` must be a non-boolean
+integer `1` or `2`. `save_manifest` validates the JSON tree and secret patterns,
+increments `revision`, updates `updated_at`, and atomically replaces the file.
 
-## Represent candidates and decisions
+New manifests use root `schema_version: 2` and must contain `operations_v2`, whose
+own closed root also has `schema_version: 2`. A root-schema-2 manifest without that
+field is invalid. The envelope itself is not closed and permits additional root
+fields.
 
-- Give every candidate a stable `id`, title, source URL, and enough available metadata to compare it with alternatives.
-- Set every candidate's `relationship` to `title_match`, `version_of_title_match`, `related_publication`, or `relevance_fallback`.
-- Treat the requested title as the primary bibliographic source. Display related publications separately from its title-matched version family.
-- Do not automatically select a `related_publication` over an eligible title-family candidate. Send uncertain relationships to consolidated review.
-- Represent each user-selectable work/version combination as its own candidate in the MVP.
-- If `result.selected_version_id` is used for an exact match, require that version to declare its own title, safe source URL, `relationship: version_of_title_match`, and `title_match_type`. Reapply requested-title-family checks to that effective version after selection; a parent candidate cannot legitimize an unrelated child version.
-- Retain optional authors, date, source type, peer-review status, relevance evidence, versions, and provenance without requiring unavailable values.
-- Set `pending_action` to `null` or an object with:
-  - `type`
-  - optional `candidate_id`
-  - optional `version_id`
-  - optional `comment`
-  - `recorded_at`
-- Use these MVP action types:
-  - `select_candidate`
-  - `accept_fallback`
-  - `retry`
-  - `retry_authenticated`
-  - `retry_public`
-  - `skip`
-  - `stop_retrying`
-- Permit unknown future action types and extra action fields.
-- Append every applied action and its outcome to `decision_history`; never discard prior decisions.
-- Clear `pending_action` only after preserving the applied action in `decision_history`.
-- Never put credentials, cookies, tokens, codes, authorization headers, or private links in comments or actions.
-- Require a complete applied `accept_fallback` entry before a relevance result can become `retrieved_verified`. It must bind the selected candidate and version, record `outcome: accepted`, and include a timezone-aware `applied_at` timestamp.
+A historical root-schema-1 manifest without `operations_v2` remains readable by
+validation and produces a legacy warning, but it is migration-only: serving
+review, saving review decisions, submitting actions, finishing, reopening, and
+export all refuse it until v2 is embedded. Root schema 1 with a valid embedded v2
+remains supported; once the field is present, the closed-state and bridge checks
+are enforced exactly as they are for root schema 2.
 
-## Drive the review loop
+Treat every manifest value as untrusted. Never store credentials, cookies,
+authorization headers, one-time codes, private keys, browser/session state,
+signed URLs, raw headers, or secret-bearing comments or provenance.
 
-- Set `review_state` to `processing`, `review_ready`, `submitted`, or `done`.
-- Show retrieved, needs-attention, and failed items in one consolidated interface. Label title-family candidates, related alternatives, and relevance fallbacks distinctly.
-- Allow bulk candidate selection, fallback acceptance, comments, retries, public fallback, skips, and stop-retrying decisions.
-- Apply all submitted actions before starting the next retry round.
-- Retry only affected items, then refresh the manifest and interface.
-- Require every pending action to be applied before accepting **Done**.
-- Require every item to be `retrieved_verified`, `not_found`, or `failed_final` before accepting **Done**.
-- Set `done` to `true` only when the terminal-state requirement is met and the user explicitly clicks **Done**.
-- Preserve the final manifest, verified artifacts, verified URLs, failures, warnings, comments, and decision history.
+## Legacy item representation
+
+Every item requires:
+
+```text
+id
+requested_title
+status
+match_type
+comment
+candidates
+selected_candidate_id
+selected_version_id
+pending_action
+decision_history
+```
+
+Item status is `pending`, `processing`, `retrieved_verified`, `ambiguous_exact`,
+`relevance_fallback`, `authentication_required`, `failed_retryable`, `not_found`,
+or `failed_final`. Match type is `exact`, `relevance`, or `none`.
+
+`selected_version_id` is nullable and, when present, names a version on
+`selected_candidate_id`. It remains available after a selection is applied even
+when retrieval later fails; a successful result repeats the same selected version.
+
+Candidates require a nonempty `id`, `title`, and safe public HTTPS `source_url`.
+When present, `relationship` is `title_match`, `version_of_title_match`,
+`related_publication`, or `relevance_fallback`; `title_match_type` is `verbatim`,
+`normalized`, `expanded`, or `different`. A candidate may contain a bounded
+`versions` array. Each version requires a unique nonempty `id`; a present
+`source_url` must be safe HTTPS. `candidate_review`, when present, contains
+`id`/`candidate_id`/`version_id` triples: each field is nonempty, and the candidate
+and version pair resolves to the item's candidate metadata.
+
+The legacy validator intentionally permits candidate metadata beyond those
+validated fields. Do not imply that candidate objects are closed or duplicated in
+v2; v2 stores only opaque selected candidate IDs and work-owned version IDs.
+
+`pending_action` is null or an object with a nonempty `type` and `recorded_at`,
+plus optional `candidate_id`, `version_id`, and `comment`. The review server queues
+only `select_candidate`, `accept_fallback`, `retry`, `retry_authenticated`,
+`retry_public`, `skip`, and `stop_retrying`. The validator warns, rather than
+fails, for an unknown future action type in a pre-v2 legacy manifest. Once v2 is
+present, its closed projected request action still makes an unsupported type an
+error. Candidate/version references must resolve when present.
+
+`decision_history` is a bounded legacy array. The batch validator does not impose
+one closed schema on every historical entry, except where a rule such as relevance
+fallback acceptance needs specific fields.
+
+## Discovery traces and success evidence
+
+`artifact_discovery` and `route_metrics` may appear on an item and may also be
+copied into its result for display. For `retrieved_verified`, the item-level
+records are canonical and required; result-level copies do not replace them. An
+artifact-discovery object requires:
+
+- `method`: `registry_metadata`, `html_metadata`, `structured_data`,
+  `embedded_document`, `download_link`, `repository_metadata`,
+`collection_index`, `user_supplied`, or `other`;
+- safe HTTPS `discovered_from` and `artifact_url`; and
+- nonempty `evidence`.
+
+`other` preserves an uncovered long-tail observation for review but is not an
+eligible discovery method for `retrieved_verified`. Search snippets, search
+indexes/caches, generated summaries, and third-party reconstructions cannot supply
+the bytes or complete text of a successful local artifact.
+
+After resolving a work/version with a verified strong identifier, record a
+separate bounded identifier-driven OA/artifact-location pass in working evidence
+and the applicable discovery route metrics. It does not count toward the
+four-query/40-hit title-discovery ceiling. Run at most four location queries and
+inspect at most 10 raw records or hits per query: broad OA/repository metadata by
+identifier, canonical-source metadata, native web search for exact title plus an
+artifact term, then—only if still needed—native web search for identifier plus the
+artifact term. Do not combine title and identifier into a mandatory all-terms
+query, substitute a scraped/feed endpoint for available native search, broaden to
+topical relevance, or spend the budget on registries that repeat the same absence.
+A structured artifact URL that later fails every applicable transfer rung does not
+suppress the remaining web query. Nonresponsive unrelated hits do not prove
+absence.
+The single item-level `artifact_discovery` object remains the canonical declaration
+for the artifact ultimately retrieved; do not invent extra manifest fields for the
+discarded leads.
+
+Each route metric requires `phase` (`discovery`, `retrieval`, or `verification`),
+nonempty `method`, and nonempty `outcome`. Optional measured fields are
+`access_mode`, safe HTTPS `url`, nonnegative `request_count`, `redirect_count`,
+`bytes`, or `elapsed_ms`, and HTTP status 100–599. Record phases separately, never
+estimate values, and do not count a `user_supplied` link as autonomous discovery.
+
+A `retrieved_verified` item requires a `result` whose
+`selected_candidate_id` matches the item selection. It also requires:
+
+```text
+format
+verified_url
+retrieval_url
+local_path
+verification_summary
+provenance
+```
+
+`format` is `pdf` or `html`. `verified_url` matches the selected candidate source
+URL, or the selected version source URL when `selected_version_id` is present.
+`retrieval_url` matches `artifact_discovery.artifact_url`. Direct discovery uses
+the actual safe HTTPS declaration source as `discovered_from`.
+`registry_metadata`, `structured_data`, `embedded_document`, `download_link`,
+`collection_index`, and `repository_metadata` may therefore declare a URL that
+differs from the verified canonical work URL. This does not relax the selected
+work/version identity, provenance, or artifact/retrieval URL checks. For
+`html_metadata` and `user_supplied`, `discovered_from` remains the verified
+canonical URL; `other` is not eligible for retrieved success.
+
+The verification summary requires positive `bytes`, lowercase `sha256`,
+`observed_title`, nonempty `verification_method`, `identity_evidence`, and
+`full_text_evidence`, timezone-aware `verified_at`, and
+`identity_verified`, `full_text_verified`, and `artifact_integrity_verified` all
+true. PDF additionally requires positive `page_count`; HTML requires
+`sanitized_inert_snapshot: true`. Provenance requires nonempty `method` and
+`source_role`, where the role is `publisher`, `issuing_organization`,
+`official_repository`, `official_collection`, `trusted_registry`,
+`author_repository`, or `other_legitimate_source`.
+
+An author upload or professional-organization archive may use the existing
+`author_repository`, `issuing_organization`, or `other_legitimate_source` role as
+the evidence supports. Verify account/domain control or uploader identity, work
+identity, and completeness. A subscriber watermark alone does not make the
+artifact ineligible. Download a plausible public copy into quarantine before the
+final role/ranking decision; quarantine does not satisfy provenance or success.
+
+Before a manual-download handoff, record concrete outcomes for each applicable
+public transfer rung: `paper_finder_fetch.py download` for bounded credential-free
+HTTPS transfer to quarantine, trusted managed-browser save/capture, and
+`paper_finder_fetch.py sanitize-html` for a complete rendered-DOM inert HTML
+capture. Use existing route metrics, access observations, attempts, and working
+evidence; this contract adds no transfer-ladder collection. A client-specific
+transfer failure is not proof that a publicly rendered artifact is unavailable.
+
+Both public helper operations refuse an existing destination and expose no
+overwrite mode. Every attempt uses a new deterministic collision-safe relative
+quarantine path so prior evidence remains intact.
+
+At least one verification route metric has `outcome: passed` and a measured byte
+count equal to the local artifact. Any verification URL matches the verified or
+retrieval source. The local artifact is a nonsymlink relative path under
+`papers/` with portable components (no device names, alternate-stream colon,
+control characters, or trailing dot/space); validation recomputes its size and
+digest and applies the format rules in [retrieval-policy.md](retrieval-policy.md).
+
+Exact success selects a title-family relationship, requires `verbatim`,
+`normalized`, or `expanded` title evidence, and requires the requested title to be
+an ordered normalized subsequence of the effective selected title. Relevance
+success selects `relevance_fallback` and requires an applied decision-history
+entry for `accept_fallback` that binds the selected candidate/version, has
+`outcome: accepted`, and has timezone-aware `applied_at`.
+
+`failed_retryable` and `failed_final` require a `failure` with nonempty `code` and
+`message` plus a boolean `retryable` matching the status. A standalone
+`sign_in_url` is rejected; use the verified selected source hostname.
+
+## Bounded artifact validation
+
+PDF success uses bounded `pdfinfo` and `pdftotext`, requires a positive declared
+and independently observed page count, enough extractable text containing the
+effective selected title, matching size and SHA-256, and a structurally valid
+terminal cross-reference.
+
+The implemented bounded terminal rule must accept the complete terminal/revision
+chain, every cross-reference table or stream, and the referenced object offsets,
+with no unexplained bytes outside the chain. Structure bytes and cumulative decoded
+cross-reference entries have independent limits. Do not reject a PDF solely
+because it uses a common valid xref stream or incremental update: it is eligible
+when the implemented validator supports and accepts that complete bounded
+structure. Unsupported, appended, forged, overlapping, cyclic, truncated,
+malformed, or inconsistent structures fail closed. Encryption/scanning that
+prevents sufficient title-bearing text and OCR-dependent files do not pass
+automated validation; the MVP does not auto-ingest OCR output.
+
+HTML success is a newly sanitized strict-UTF-8 document with exactly one doctype
+and one `html`/`head`/`body`, exact UTF-8 meta first, and
+`default-src 'none'; base-uri 'none'; form-action 'none'` as the second head
+element. It stays within node, attribute, depth, text, and byte limits; contains no
+active/remote content, comments, duplicate attributes, or external link targets;
+and has enough body text containing the effective title.
+
+An official complete abstract is sufficient only when the selected source is a
+meeting abstract. An abstract page is not full text for a selected article.
+
+## Actual v2 bridge
+
+For manifests that contain `operations_v2`, that object is authoritative for the
+operational entities it represents. The current bridge validates a limited overlap
+with legacy items; it does not fully generate, overwrite, or synchronize the item
+array.
+
+The implemented checks are exactly:
+
+1. validate the closed v2 state;
+2. map legacy `review_state` to v2 `status`:
+   `processing` → `active`, `review_ready` → `review`, `submitted` → `review`
+   or `active`, and `done` → `done`;
+3. require one v2 request per item and match it by `input_index`;
+4. require `request.title == item.requested_title`;
+5. require request `comment` and `selected_candidate_id` to equal the legacy item;
+6. require request `selected_version_id` to equal item `selected_version_id`; for
+   historical items without that field, fall back to `item.result.selected_version_id`
+   or null when there is no result;
+7. require request `pending_action` and `decision_history` to equal their closed v2
+   projections from the legacy records: candidate/version IDs are retained, a
+   decision comment falls back to the item comment, legacy `type` becomes v2
+   `action`, a pending outcome becomes `queued`, and historical `accepted` becomes
+   `succeeded`;
+8. require compatible statuses:
+   - legacy `pending`/`processing` → v2 `pending`;
+   - `retrieved_verified` → `retrieved`;
+   - the four attention statuses → `attention`;
+   - `not_found`/`failed_final` → `failed` or `skipped`;
+9. for `retrieved_verified`, compare the referenced v2 artifact's `format`,
+   `verified_url`, `local_relpath`, `bytes`, and `sha256` with the legacy result;
+   and
+10. when the legacy result has `selected_version_id`, require the v2 artifact to
+   use it.
+
+The bridge does not compare or copy candidate objects, candidate-review options,
+artifact-discovery evidence, route metrics, retrieval URL, detailed verification
+summary, provenance, or other legacy-only metadata. Apart from initialization and
+the review-server update described below, it validates rather than regenerates or
+repairs either representation. The active Codex process must apply queued
+decisions and update both representations atomically wherever their implemented
+overlap requires agreement. Do not claim that item regeneration or full
+bidirectional synchronization exists.
+
+## Honest review queue
+
+Open review only at `review_ready` with v2 `status: review`. Saving an item decision
+records a legacy pending action against the current manifest revision and mirrors
+the item comment plus the closed queued-action projection into the matching v2
+request. It does not change the v2 selection, decision history, status, or
+handoffs. **Submit queued actions to Codex** requires at least one pending action,
+changes legacy `review_state` to `submitted`, and shuts down the short-lived
+server. At that queued boundary v2 may remain `review`; it may be changed to
+`active` while the agent applies the round. The button does not search, retry,
+browse, download, ingest, create a handoff, or apply the decision.
+
+The active Codex process consumes the complete submitted set, performs affected
+work, updates legacy and v2 records, clears or archives pending actions, validates,
+and reopens review. Every control must use queue language; the localhost page has
+no retrieval backend.
+
+The review server binds to `127.0.0.1`, uses an in-memory route token, rejects
+non-loopback Host headers and stale or externally changed revisions, and stops
+after a batch action.
+
+## Completion invariant
+
+The legacy **Finish batch** action first requires:
+
+- no legacy pending action; and
+- every item in `retrieved_verified`, `not_found`, or `failed_final`.
+
+When v2 exists, completion sets its `status` to `done` and validates the exact
+done-state invariant in [operations-v2.md](operations-v2.md): all handoffs closed,
+requests and works terminal, no pending request action, no active attempt, no
+pending provider prompt or next action, every resolved retry request backed by a
+matching terminal attempt, no artifact left in candidate status, and consistent
+verified-artifact and shared-work outcomes. Only then may the manifest set
+`review_state: done` and `done: true`.
+
+The v2 validator—not a separate requirement for a suppression per retry—defines
+whether attempt history is terminal. Export requires a valid done manifest and no
+unfinished v2 handoff. Reopening explicitly returns legacy review state and v2
+status to review; completion otherwise remains terminal.

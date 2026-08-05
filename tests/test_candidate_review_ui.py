@@ -85,8 +85,14 @@ class CandidateReviewUiTests(unittest.TestCase):
             "async function stageBulkDecision()",
         )
         self.assertIn("const selection = radioDecisionSelection(candidate);", save)
-        self.assertIn("candidate_id: selection.candidate_id", save)
-        self.assertIn("version_id: selection.version_id", save)
+        self.assertIn(
+            "candidate_id: isCandidateAction ? selection.candidate_id : null",
+            save,
+        )
+        self.assertIn(
+            "version_id: isCandidateAction ? selection.version_id : null",
+            save,
+        )
 
         item_render = function_source(
             self.script,

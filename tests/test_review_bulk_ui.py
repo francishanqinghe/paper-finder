@@ -86,7 +86,7 @@ class BulkReviewUiTests(unittest.TestCase):
         self.assertIn("api/items/", stage)
         self.assertIn("/decision", stage)
         self.assertNotIn("api/batch", stage)
-        self.assertIn("Apply decisions is still required", stage)
+        self.assertIn("submitting queued actions is still required", stage)
         self.assertIn('request("api/batch"', finish)
 
     def test_review_javascript_is_syntactically_valid(self) -> None:
@@ -101,6 +101,39 @@ class BulkReviewUiTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_retry_wording_describes_a_queue_not_a_backend(self) -> None:
+        self.assertIn(
+            "This page records decisions for Codex; it does not search or download by itself.",
+            self.review_html,
+        )
+        self.assertIn("Queue another search round", self.review_html)
+        self.assertIn("Queue a public-source search", self.review_html)
+        self.assertIn("Submit queued actions to Codex", self.review_html)
+        self.assertIn("Finish batch", self.review_html)
+        self.assertNotIn('<option value="retry">Retry</option>', self.review_html)
+        self.assertNotIn('id="apply" class="primary">Apply decisions</button>', self.review_html)
+        self.assertIn("No search was started by this page", self.review_html)
+
+    def test_non_candidate_actions_do_not_submit_stale_radio_selection(self) -> None:
+        save = function_source(
+            self.script,
+            "async function saveDecision(item, select, textarea)",
+            "async function stageBulkDecision()",
+        )
+        self.assertIn(
+            'const isCandidateAction = ["select_candidate", "accept_fallback"].includes(action);',
+            save,
+        )
+        self.assertIn(
+            "candidate_id: isCandidateAction ? selection.candidate_id : null",
+            save,
+        )
+        self.assertIn(
+            "version_id: isCandidateAction ? selection.version_id : null",
+            save,
+        )
+        self.assertIn("textarea.maxLength = 10000;", self.script)
 
 
 if __name__ == "__main__":
